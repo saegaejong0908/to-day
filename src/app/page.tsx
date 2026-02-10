@@ -80,7 +80,7 @@ type TodoItem = {
   createdAt?: unknown;
   completedAt?: unknown;
   dueAt?: unknown;
-  missedReasonType?: MissedReasonType;
+  missedReasonType?: MissedReasonType | null;
 };
 
 type CalendarEvent = {
@@ -181,17 +181,75 @@ const INTENSITY_LABELS: Record<Effect["intensity"], string> = {
   3: "강",
 };
 const MISSED_REASON_LABELS: Record<MissedReasonType, string> = {
-  [MissedReasonType.FORGOT]: "완료했는데, 체크를 못했어요",
+  [MissedReasonType.COMPLETED_BUT_NOT_CHECKED]: "완료했는데, 체크를 못했어요",
   [MissedReasonType.HARD_TO_START]: "시작하기가 어려워요",
-  [MissedReasonType.TOO_BIG]: "너무 큼",
-  [MissedReasonType.EMOTIONALLY_HEAVY]: "감정적으로 부담",
-  [MissedReasonType.TIME_MISMATCH]: "끝내기 위한 시간이 부족해요",
-  [MissedReasonType.JUST_SKIP]: "오늘은 쉬고싶어요",
+  [MissedReasonType.NOT_ENOUGH_TIME]: "끝내기 위한 시간이 부족해요",
+  [MissedReasonType.WANT_TO_REST]: "오늘은 쉬고싶어요",
 };
 const AI_ELIGIBLE_REASONS = new Set<MissedReasonType>([
   MissedReasonType.HARD_TO_START,
-  MissedReasonType.TIME_MISMATCH,
+  MissedReasonType.NOT_ENOUGH_TIME,
 ]);
+
+const HARD_TO_START_QUESTION_POOL = [
+  "딱 시작만 한다면, 첫 행동은 뭐였을까요?",
+  "이 투두에서 ‘생각 안 해도 되는 최소 행동’은 뭘까요?",
+  "지금 당장 1분 안에 할 수 있는 행동으로 바꾼다면?",
+  "이 일을 시작할 때 가장 귀찮은 부분은 어디인가요?",
+  "누군가 옆에서 ‘이것만 하자’고 말해준다면 뭐가 좋을까요?",
+] as const;
+
+const NOT_ENOUGH_TIME_QUESTION_POOL = [
+  "오늘 꼭 하지 않아도 되는 부분은 뭘까요?",
+  "전체 중 절반만 한다면 어디까지가 적당할까요?",
+  "이 투두를 10분짜리로 줄인다면 남길 건 뭘까요?",
+  "완벽하지 않아도 괜찮다면, 오늘 어디까지면 충분할까요?",
+] as const;
+
+const hashStringToInt = (input: string) => {
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+};
+
+const pickStableQuestions = (
+  seed: string,
+  pool: readonly string[],
+  min: 2 | 3 = 2,
+  max: 2 | 3 = 3
+) => {
+  if (pool.length <= min) return [...pool];
+  const hash = hashStringToInt(seed);
+  const count = (hash % (max - min + 1)) + min;
+  const indices = pool.map((_, index) => index);
+  // stable shuffle (Fisher–Yates variant)
+  let state = hash || 1;
+  for (let i = indices.length - 1; i > 0; i -= 1) {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    const j = state % (i + 1);
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  return indices.slice(0, Math.min(count, pool.length)).map((i) => pool[i]);
+};
+
+const normalizeMissedReasonType = (value: unknown): MissedReasonType | null => {
+  // supports old stored values
+  if (value === "FORGOT") return MissedReasonType.COMPLETED_BUT_NOT_CHECKED;
+  if (value === "HARD_TO_START") return MissedReasonType.HARD_TO_START;
+  if (value === "TIME_MISMATCH") return MissedReasonType.NOT_ENOUGH_TIME;
+  if (value === "JUST_SKIP") return MissedReasonType.WANT_TO_REST;
+  if (
+    value === MissedReasonType.COMPLETED_BUT_NOT_CHECKED ||
+    value === MissedReasonType.HARD_TO_START ||
+    value === MissedReasonType.NOT_ENOUGH_TIME ||
+    value === MissedReasonType.WANT_TO_REST
+  ) {
+    return value as MissedReasonType;
+  }
+  return null;
+};
 
 const toMillis = (value: unknown): number | null => {
   if (!value) return null;
@@ -423,7 +481,7 @@ export default function Home() {
   const [todoAIResults, setTodoAIResults] = useState<
     Record<
       string,
-      { reflectionQuestions: string[]; rewrittenTodo: string }
+      { conditionMessage: string; rewrittenTodo: string }
     >
   >({});
   const [todoAILoading, setTodoAILoading] = useState<Record<string, boolean>>(
@@ -700,7 +758,7 @@ export default function Home() {
           createdAt: data.createdAt,
           completedAt: data.completedAt,
           dueAt: data.dueAt,
-          missedReasonType: data.missedReasonType,
+          missedReasonType: normalizeMissedReasonType(data.missedReasonType),
         };
       });
       setTodos(nextTodos);
@@ -1180,12 +1238,68 @@ export default function Home() {
       "todos",
       todo.id
     );
-    await updateDoc(todoRef, { missedReasonType: reasonType });
+    await updateDoc(todoRef, {
+      missedReasonType: reasonType,
+      missedReasonUpdatedAt: serverTimestamp(),
+    });
+    clearTodoAIResult(todo.id);
+    try {
+      const interventionsRef = collection(
+        db,
+        "users",
+        user.uid,
+        "days",
+        todayKey,
+        "todoInterventions"
+      );
+      await addDoc(interventionsRef, {
+        todoId: todo.id,
+        reasonType,
+        kind: "REASON_SELECTED",
+        todoText: todo.text,
+        createdAt: serverTimestamp(),
+      });
+    } catch {
+      // ignore logging failures
+    }
+  };
+
+  /* const normalizeMissedReasonType = (value: unknown): MissedReasonType | null => {
+    // supports old stored values
+    if (value === "FORGOT") return MissedReasonType.COMPLETED_BUT_NOT_CHECKED;
+    if (value === "HARD_TO_START") return MissedReasonType.HARD_TO_START;
+    if (value === "TIME_MISMATCH") return MissedReasonType.NOT_ENOUGH_TIME;
+    if (value === "JUST_SKIP") return MissedReasonType.WANT_TO_REST;
+    if (
+      value === MissedReasonType.COMPLETED_BUT_NOT_CHECKED ||
+      value === MissedReasonType.HARD_TO_START ||
+      value === MissedReasonType.NOT_ENOUGH_TIME ||
+      value === MissedReasonType.WANT_TO_REST
+    ) {\n+      return value as MissedReasonType;\n+    }\n+    return null;\n+  };\n*** End Patch"}?>  北京赛车冠军 code block invalid? Need proper patch string without JSON. We'll redo.
+
+  */
+
+  const normalizeMissedReasonType = (
+    value: unknown
+  ): MissedReasonType | null => {
+    if (value === "FORGOT") return MissedReasonType.COMPLETED_BUT_NOT_CHECKED;
+    if (value === "HARD_TO_START") return MissedReasonType.HARD_TO_START;
+    if (value === "TIME_MISMATCH") return MissedReasonType.NOT_ENOUGH_TIME;
+    if (value === "JUST_SKIP") return MissedReasonType.WANT_TO_REST;
+    if (
+      value === MissedReasonType.COMPLETED_BUT_NOT_CHECKED ||
+      value === MissedReasonType.HARD_TO_START ||
+      value === MissedReasonType.NOT_ENOUGH_TIME ||
+      value === MissedReasonType.WANT_TO_REST
+    ) {
+      return value as MissedReasonType;
+    }
+    return null;
   };
 
   const handleGenerateReasonHelp = async (todo: TodoItem) => {
     const dueAtMillis = toMillis(todo.dueAt);
-    const reasonType = todo.missedReasonType;
+    const reasonType = normalizeMissedReasonType(todo.missedReasonType);
     if (
       todo.done ||
       !dueAtMillis ||
@@ -1197,6 +1311,16 @@ export default function Home() {
     }
     setTodoAILoading((prev) => ({ ...prev, [todo.id]: true }));
     setTodoAIError((prev) => ({ ...prev, [todo.id]: "" }));
+    const contextQuestions =
+      reasonType === MissedReasonType.HARD_TO_START
+        ? pickStableQuestions(
+            `${todo.id}-${reasonType}`,
+            HARD_TO_START_QUESTION_POOL
+          )
+        : pickStableQuestions(
+            `${todo.id}-${reasonType}`,
+            NOT_ENOUGH_TIME_QUESTION_POOL
+          );
     const result = await (async () => {
       try {
         const response = await fetch("/api/ai/rewrite-todo", {
@@ -1207,15 +1331,14 @@ export default function Home() {
             reasonType:
               reasonType === MissedReasonType.HARD_TO_START
                 ? "HARD_TO_START"
-                : reasonType === MissedReasonType.TIME_MISMATCH
-                  ? "TIME_MISMATCH"
-                  : "HARD_TO_START",
+                : "NOT_ENOUGH_TIME",
+            contextQuestions,
           }),
         });
         if (!response.ok) return null;
         const data = (await response.json()) as {
           result?: {
-            reflectionQuestions: string[];
+            conditionMessage: string;
             rewrittenTodo: string;
           } | null;
         };
@@ -1271,6 +1394,43 @@ export default function Home() {
 
   const handleKeepTodo = (todoId: string) => {
     clearTodoAIResult(todoId);
+  };
+
+  const handleConfirmCompletedButNotChecked = async (todo: TodoItem) => {
+    if (!user || !db) return;
+    const todoRef = doc(
+      db,
+      "users",
+      user.uid,
+      "days",
+      todayKey,
+      "todos",
+      todo.id
+    );
+    await updateDoc(todoRef, {
+      done: true,
+      completedAt: serverTimestamp(),
+      completionNote: "COMPLETED_BUT_NOT_CHECKED",
+    });
+    try {
+      const interventionsRef = collection(
+        db,
+        "users",
+        user.uid,
+        "days",
+        todayKey,
+        "todoInterventions"
+      );
+      await addDoc(interventionsRef, {
+        todoId: todo.id,
+        reasonType: MissedReasonType.COMPLETED_BUT_NOT_CHECKED,
+        kind: "COMPLETED_CONFIRMED",
+        todoText: todo.text,
+        createdAt: serverTimestamp(),
+      });
+    } catch {
+      // ignore logging failures
+    }
   };
 
   const handleAddEvent = async () => {
@@ -2295,13 +2455,28 @@ export default function Home() {
                   const dueAtMillis = toMillis(todo.dueAt);
                   const isOverdue =
                     !todo.done && dueAtMillis !== null && dueAtMillis < Date.now();
+                  const selectedReason = normalizeMissedReasonType(
+                    todo.missedReasonType
+                  );
                   const aiReady =
                     isOverdue &&
-                    todo.missedReasonType &&
-                    AI_ELIGIBLE_REASONS.has(todo.missedReasonType);
+                    selectedReason !== null &&
+                    AI_ELIGIBLE_REASONS.has(selectedReason);
                   const aiResult = todoAIResults[todo.id];
                   const aiError = todoAIError[todo.id];
                   const aiLoading = todoAILoading[todo.id];
+                  const interventionQuestions =
+                    selectedReason === MissedReasonType.HARD_TO_START
+                      ? pickStableQuestions(
+                          `${todo.id}-${selectedReason}`,
+                          HARD_TO_START_QUESTION_POOL
+                        )
+                      : selectedReason === MissedReasonType.NOT_ENOUGH_TIME
+                        ? pickStableQuestions(
+                            `${todo.id}-${selectedReason}`,
+                            NOT_ENOUGH_TIME_QUESTION_POOL
+                          )
+                        : [];
                   return (
                 <div
                   key={todo.id}
@@ -2347,7 +2522,7 @@ export default function Home() {
                             어디서 막혔는지 선택하세요
                           </label>
                           <select
-                            value={todo.missedReasonType ?? ""}
+                            value={selectedReason ?? ""}
                             onChange={(event) =>
                               handleUpdateMissedReason(
                                 todo,
@@ -2360,10 +2535,10 @@ export default function Home() {
                               선택하세요
                             </option>
                             {[
-                              MissedReasonType.FORGOT,
+                              MissedReasonType.COMPLETED_BUT_NOT_CHECKED,
                               MissedReasonType.HARD_TO_START,
-                              MissedReasonType.TIME_MISMATCH,
-                              MissedReasonType.JUST_SKIP,
+                              MissedReasonType.NOT_ENOUGH_TIME,
+                              MissedReasonType.WANT_TO_REST,
                             ].map((reason) => (
                               <option key={reason} value={reason}>
                                 {MISSED_REASON_LABELS[reason]}
@@ -2388,6 +2563,41 @@ export default function Home() {
                           )}
                         </div>
                       )}
+                      {!todo.done &&
+                        isOverdue &&
+                        selectedReason ===
+                          MissedReasonType.COMPLETED_BUT_NOT_CHECKED && (
+                          <div className="mt-2">
+                            <button
+                              className="w-full rounded-full bg-slate-900 px-3 py-2 text-xs font-semibold text-white"
+                              type="button"
+                              onClick={() =>
+                                handleConfirmCompletedButNotChecked(todo)
+                              }
+                            >
+                              완료 처리할까요?
+                            </button>
+                          </div>
+                        )}
+                      {!todo.done &&
+                        isOverdue &&
+                        selectedReason === MissedReasonType.WANT_TO_REST && (
+                          <p className="mt-2 text-xs text-slate-500">
+                            오늘은 회복이 우선이에요. 기록만 남겼어요.
+                          </p>
+                        )}
+                      {interventionQuestions.length > 0 && (
+                        <div className="mt-3 rounded-2xl border border-slate-100 bg-slate-50 p-3">
+                          <p className="text-[11px] text-slate-400">
+                            생각을 꺼내는 질문
+                          </p>
+                          <div className="mt-2 space-y-1 text-xs text-slate-600">
+                            {interventionQuestions.map((question) => (
+                              <p key={question}>· {question}</p>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                       {aiResult && (
                         <div className="mt-3 rounded-2xl border border-slate-100 bg-slate-50 p-4">
                           <div className="flex items-center justify-between">
@@ -2396,19 +2606,9 @@ export default function Home() {
                             </p>
                           </div>
                           <div className="mt-3 space-y-2">
-                            <div>
-                              <p className="text-[11px] text-slate-400">
-                                상태 인식 질문
-                              </p>
-                              <div className="mt-2 space-y-1 text-xs text-slate-600">
-                                {aiResult.reflectionQuestions.map((question) => (
-                                  <p key={question}>· {question}</p>
-                                ))}
-                              </div>
-                            </div>
                             <div className="rounded-2xl border border-slate-200 bg-white p-3">
                               <p className="text-[11px] text-slate-400">
-                                이렇게 바꿔볼래요?
+                                {aiResult.conditionMessage}
                               </p>
                               <p className="mt-1 text-sm text-slate-700">
                                 {aiResult.rewrittenTodo}
