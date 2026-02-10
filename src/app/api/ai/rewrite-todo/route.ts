@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { rewriteTodoWithReason } from "@/ai/rewriteTodoWithReason";
 
-type ReasonType = "HARD_TO_START" | "TOO_BIG" | "EMOTIONALLY_HEAVY";
+type ReasonType = "HARD_TO_START" | "TIME_MISMATCH";
 
 const isReasonType = (value: unknown): value is ReasonType =>
-  value === "HARD_TO_START" || value === "TOO_BIG" || value === "EMOTIONALLY_HEAVY";
+  value === "HARD_TO_START" || value === "TIME_MISMATCH";
 
 export async function POST(request: Request) {
   try {

@@ -181,17 +181,16 @@ const INTENSITY_LABELS: Record<Effect["intensity"], string> = {
   3: "강",
 };
 const MISSED_REASON_LABELS: Record<MissedReasonType, string> = {
-  [MissedReasonType.FORGOT]: "잊어버림",
-  [MissedReasonType.HARD_TO_START]: "시작이 어려움",
+  [MissedReasonType.FORGOT]: "완료했는데, 체크를 못했어요",
+  [MissedReasonType.HARD_TO_START]: "시작하기가 어려워요",
   [MissedReasonType.TOO_BIG]: "너무 큼",
   [MissedReasonType.EMOTIONALLY_HEAVY]: "감정적으로 부담",
-  [MissedReasonType.TIME_MISMATCH]: "시간이 안 맞음",
-  [MissedReasonType.JUST_SKIP]: "그냥 건너뜀",
+  [MissedReasonType.TIME_MISMATCH]: "끝내기 위한 시간이 부족해요",
+  [MissedReasonType.JUST_SKIP]: "오늘은 쉬고싶어요",
 };
 const AI_ELIGIBLE_REASONS = new Set<MissedReasonType>([
   MissedReasonType.HARD_TO_START,
-  MissedReasonType.TOO_BIG,
-  MissedReasonType.EMOTIONALLY_HEAVY,
+  MissedReasonType.TIME_MISMATCH,
 ]);
 
 const toMillis = (value: unknown): number | null => {
@@ -1208,9 +1207,9 @@ export default function Home() {
             reasonType:
               reasonType === MissedReasonType.HARD_TO_START
                 ? "HARD_TO_START"
-                : reasonType === MissedReasonType.TOO_BIG
-                  ? "TOO_BIG"
-                  : "EMOTIONALLY_HEAVY",
+                : reasonType === MissedReasonType.TIME_MISMATCH
+                  ? "TIME_MISMATCH"
+                  : "HARD_TO_START",
           }),
         });
         if (!response.ok) return null;
@@ -2360,7 +2359,12 @@ export default function Home() {
                             <option value="" disabled>
                               선택하세요
                             </option>
-                            {Object.values(MissedReasonType).map((reason) => (
+                            {[
+                              MissedReasonType.FORGOT,
+                              MissedReasonType.HARD_TO_START,
+                              MissedReasonType.TIME_MISMATCH,
+                              MissedReasonType.JUST_SKIP,
+                            ].map((reason) => (
                               <option key={reason} value={reason}>
                                 {MISSED_REASON_LABELS[reason]}
                               </option>

@@ -1,6 +1,6 @@
 import "server-only";
 
-type ReasonType = "HARD_TO_START" | "TOO_BIG" | "EMOTIONALLY_HEAVY";
+type ReasonType = "HARD_TO_START" | "TIME_MISMATCH";
 
 const SYSTEM_PROMPT =
   "너는 할 일을 다시 구성하는 도구다.\n설명하거나 판단하지 말고, 요청한 결과만 생성하라.";
@@ -21,27 +21,12 @@ const buildUserPrompt = (originalTodoText: string, reasonType: ReasonType) => {
   "rewrittenTodo": "..."
 }`;
   }
-  if (reasonType === "TOO_BIG") {
-    return `기존 할 일: "${originalTodoText}"
-
-이 사용자는 이 할 일이 '너무 커서' 하지 못했다.
-아래를 생성하라:
-1) 막히는 지점을 인식하는 질문 1~2개
-2) 가장 작은 하위 단계 투두 1개
-
-출력은 반드시 아래 JSON 형식만 사용하라.
-
-{
-  "reflectionQuestions": ["...", "..."],
-  "rewrittenTodo": "..."
-}`;
-  }
   return `기존 할 일: "${originalTodoText}"
 
-이 사용자는 이 할 일이 '감정적으로 부담돼서' 하지 못했다.
+이 사용자는 이 할 일을 끝내기 위한 시간이 부족해서 하지 못했다.
 아래를 생성하라:
-1) 감정을 인식할 수 있는 질문 1~2개
-2) 부담 없는 대체 투두 1개
+1) 시간/범위를 인식할 수 있는 질문 1~2개
+2) 지금 남은 시간 안에 끝낼 수 있는 형태로 줄인 새로운 투두 1개
 
 출력은 반드시 아래 JSON 형식만 사용하라.
 
