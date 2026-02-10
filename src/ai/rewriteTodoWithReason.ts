@@ -58,7 +58,8 @@ const parseResult = (raw: string) => {
   };
   const questions = Array.isArray(parsed.reflectionQuestions)
     ? parsed.reflectionQuestions.filter(
-        (item): item is string => typeof item === "string" && item.trim()
+        (item): item is string =>
+          typeof item === "string" && item.trim().length > 0
       )
     : [];
   const rewrittenTodo =
