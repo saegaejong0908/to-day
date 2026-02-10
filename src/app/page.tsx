@@ -404,6 +404,7 @@ export default function Home() {
   const [timerFinished, setTimerFinished] = useState(false);
   const bodyOverflowRef = useRef<string | null>(null);
   const timerNotifiedRef = useRef(false);
+  const autoRefreshRef = useRef(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [wakeSaved, setWakeSaved] = useState(false);
   const [routineSaved, setRoutineSaved] = useState(false);
@@ -846,6 +847,49 @@ export default function Home() {
       // ignore storage failures
     }
   }, [buildTime]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !buildTime) return;
+    let isMounted = true;
+    const checkVersion = async () => {
+      try {
+        const response = await fetch("/api/version", { cache: "no-store" });
+        if (!response.ok) return;
+        const data = (await response.json()) as { version?: string };
+        if (!isMounted) return;
+        if (data?.version && data.version !== buildTime) {
+          setUpdateAvailable(true);
+        }
+      } catch {
+        // ignore version check failures
+      }
+    };
+    checkVersion();
+    const intervalId = window.setInterval(checkVersion, 60000);
+    return () => {
+      isMounted = false;
+      window.clearInterval(intervalId);
+    };
+  }, [buildTime]);
+
+  useEffect(() => {
+    if (!updateAvailable) return;
+    if (autoRefreshRef.current) return;
+    autoRefreshRef.current = true;
+    const refreshIfVisible = () => {
+      if (typeof document === "undefined") return;
+      if (document.visibilityState !== "visible") return;
+      if (modalOpen) return;
+      handleRefreshApp();
+    };
+    const timeoutId = window.setTimeout(refreshIfVisible, 1200);
+    const onVisibility = () => refreshIfVisible();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearTimeout(timeoutId);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [updateAvailable]);
 
   useEffect(() => {
     return listenForForegroundMessages((payload) => {
@@ -1300,7 +1344,17 @@ export default function Home() {
     try {
       if ("serviceWorker" in navigator) {
         const registrations = await navigator.serviceWorker.getRegistrations();
-        await Promise.all(registrations.map((registration) => registration.unregister()));
+        await Promise.all(
+          registrations.map(async (registration) => {
+            try {
+              await registration.update();
+              registration.waiting?.postMessage({ type: "SKIP_WAITING" });
+            } catch {
+              // ignore update failures
+            }
+            await registration.unregister();
+          })
+        );
       }
       if ("caches" in window) {
         const cacheKeys = await caches.keys();
@@ -1309,7 +1363,16 @@ export default function Home() {
     } catch {
       // ignore cache or service worker failures
     }
-    window.location.replace(`/?v=${Date.now()}`);
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("v", `${Date.now()}`);
+    window.location.replace(nextUrl.toString());
+    window.setTimeout(() => {
+      try {
+        window.location.reload();
+      } catch {
+        // ignore reload failures
+      }
+    }, 1500);
   };
 
   const handleAddApp = () => {
@@ -2363,7 +2426,7 @@ export default function Home() {
                                     )
                                   }
                                 >
-                                기존 투두 수정하기
+                                기존 투두 수정
                                 </button>
                               </div>
                             </div>
