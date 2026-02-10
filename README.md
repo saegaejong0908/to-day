@@ -68,6 +68,8 @@ Firebase Auth는 Google 로그인으로 구성되어 있습니다. Firebase 콘�
 
 ## 참고
 
+자동 배포 테스트용 변경입니다.
+
 To learn more about Next.js, take a look at the following resources:
 
 - [Next.js Documentation](https://nextjs.org/docs)
