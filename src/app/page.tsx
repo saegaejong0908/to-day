@@ -419,7 +419,7 @@ export default function Home() {
   const [effectModalTodo, setEffectModalTodo] = useState<TodoItem | null>(null);
   const [effectSelections, setEffectSelections] = useState<
     Record<EffectType, Effect["intensity"]>
-  >({});
+  >(() => ({} as Record<EffectType, Effect["intensity"]>));
   const [todoAIResults, setTodoAIResults] = useState<
     Record<
       string,
