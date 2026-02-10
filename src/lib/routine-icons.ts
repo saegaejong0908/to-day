@@ -230,7 +230,6 @@ export function getIconForRoutine(text: string): string {
   const normalized = text.replace(/\s/g, "").toLowerCase();
 
   const match = sortedIconRules.find((rule) => {
-    if (rule.keywords.length === 0) return false;
     const keywordMatch = rule.keywords.some((keyword) =>
       normalized.includes(keyword)
     );
