@@ -2554,7 +2554,9 @@ export default function Home() {
                             onClick={() => handleGenerateReasonHelp(todo)}
                             disabled={aiLoading}
                           >
-                            {aiLoading ? "생성 중..." : "AI 제안 받기"}
+                            {aiLoading
+                              ? "생성 중..."
+                              : "기존 투두 수정 제안"}
                           </button>
                           {aiError && (
                             <p className="mt-1 text-[11px] text-rose-400">
