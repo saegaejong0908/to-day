@@ -1,0 +1,7 @@
+[
+  {
+    "key": "ctrl+alt+s",
+    "command": "workbench.action.tasks.runTask",
+    "args": "Ship: commit & push"
+  }
+]

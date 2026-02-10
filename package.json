@@ -7,7 +7,8 @@
     "dev:open": "start http://localhost:3000 && next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "ship": "powershell -ExecutionPolicy Bypass -File scripts/ship.ps1"
   },
   "dependencies": {
     "firebase": "^12.8.0",
