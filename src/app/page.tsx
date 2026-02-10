@@ -1034,7 +1034,7 @@ export default function Home() {
   const handleToggleTodo = async (todo: TodoItem) => {
     if (!user || !db) return;
     if (!todo.done) {
-      setEffectSelections({});
+      setEffectSelections(() => ({} as Record<EffectType, Effect["intensity"]>));
       setEffectModalTodo(todo);
       return;
     }
@@ -1071,7 +1071,7 @@ export default function Home() {
 
   const closeEffectModal = () => {
     setEffectModalTodo(null);
-    setEffectSelections({});
+    setEffectSelections(() => ({} as Record<EffectType, Effect["intensity"]>));
   };
 
   const handleConfirmEffects = async () => {
