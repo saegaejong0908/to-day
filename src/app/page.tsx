@@ -2269,7 +2269,7 @@ export default function Home() {
                           삭제
                         </button>
                       </div>
-                      {todo.dueAt && (
+                      {dueAtMillis !== null && (
                         <p
                           className={`mt-1 text-[11px] ${
                             isOverdue ? "text-rose-400" : "text-slate-400"
