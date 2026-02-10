@@ -2344,7 +2344,7 @@ export default function Home() {
                       {!todo.done && isOverdue && (
                         <div className="mt-2">
                           <label className="text-[11px] text-slate-400">
-                            못한 이유
+                            어디서 막혔는지 선택하세요
                           </label>
                           <select
                             value={todo.missedReasonType ?? ""}
