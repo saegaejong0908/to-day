@@ -92,6 +92,7 @@ type TodoItem = {
   completedAt?: unknown;
   dueAt?: unknown;
   missedReasonType?: MissedReasonType | null;
+  goalId?: string | null;
 };
 
 type CalendarEvent = {
@@ -799,6 +800,7 @@ export default function Home() {
           completedAt: data.completedAt,
           dueAt: data.dueAt,
           missedReasonType: normalizeMissedReasonType(data.missedReasonType),
+          goalId: typeof data.goalId === "string" ? data.goalId : null,
         };
       });
       setTodos(nextTodos);
@@ -1252,6 +1254,20 @@ export default function Home() {
     });
     setNewTodo("");
     setNewTodoDueAt("");
+  };
+
+  const handleAddAiTodoAsTodo = async (todoText: string, goalId?: string) => {
+    if (!user || !db || !todoText.trim()) return;
+    const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
+    await addDoc(todosRef, {
+      text: todoText.trim(),
+      done: false,
+      effects: [],
+      completedAt: null,
+      dueAt: null,
+      goalId: goalId || null,
+      createdAt: serverTimestamp(),
+    });
   };
 
   const handleToggleTodo = async (todo: TodoItem) => {
@@ -2220,6 +2236,15 @@ export default function Home() {
                         style={{ width: `${goal.progress}%` }}
                       />
                     </div>
+                    {goal.progress < 30 && goal.roadmap.monthlyPlan.length > 0 && (
+                      <button
+                        type="button"
+                        className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600"
+                        onClick={() => setActiveTab("log")}
+                      >
+                        정체기 극복하기 →
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -2227,8 +2252,8 @@ export default function Home() {
 
             <section className="rounded-3xl bg-white p-5 shadow-sm">
               <div className="flex items-center justify-between">
-                <p className="text-sm font-semibold">오늘의 핵심</p>
-                <p className="text-xs text-slate-400">지금 바로 할 일</p>
+                <p className="text-sm font-semibold">오늘 실행</p>
+                <p className="text-xs text-slate-400">목표에서 내려온 할 일</p>
               </div>
               <div className="mt-3 grid gap-3 text-sm">
                 <div className="rounded-2xl border border-slate-100 px-4 py-3">
@@ -2261,9 +2286,9 @@ export default function Home() {
             </section>
 
             <section className="rounded-3xl bg-white p-5 shadow-sm">
-              <p className="text-sm font-semibold">빠른 투두 추가</p>
+              <p className="text-sm font-semibold">실행 추가</p>
               <p className="text-xs text-slate-400">
-                생각난 일을 바로 기록하세요.
+                목표에서 내려온 실행을 추가하세요.
               </p>
               <div className="mt-3 flex flex-col gap-2">
                 <input
@@ -2627,9 +2652,9 @@ export default function Home() {
             </section>
 
             <section className="rounded-3xl bg-white p-5 shadow-sm">
-              <p className="text-sm font-semibold">1년 목표</p>
+                <p className="text-sm font-semibold">1년 목표</p>
               <p className="text-xs text-slate-400">
-                목표를 입력하면 3/6/9월 목표와 월간 계획을 만들어줘요.
+                목표를 입력하면 전략과 실행 구조가 자동으로 만들어져요.
               </p>
               <div className="mt-4 space-y-2 text-sm">
                 <input
@@ -2720,10 +2745,22 @@ export default function Home() {
                       </div>
                     </div>
                     <div className="mt-3 rounded-2xl bg-white p-3">
-                      <p className="text-[11px] text-slate-400">AI 투두 3개</p>
-                      <div className="mt-2 space-y-1 text-xs text-slate-600">
+                      <p className="text-[11px] text-slate-400">실행 가능한 투두 3개</p>
+                      <div className="mt-2 space-y-2 text-xs text-slate-600">
                         {goal.aiTodos.map((todo) => (
-                          <p key={todo}>· {todo}</p>
+                          <div
+                            key={todo}
+                            className="flex items-center justify-between gap-2 rounded-xl bg-slate-50 px-2 py-1.5"
+                          >
+                            <span>· {todo}</span>
+                            <button
+                              type="button"
+                              className="rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600"
+                              onClick={() => handleAddAiTodoAsTodo(todo, goal.id)}
+                            >
+                              오늘 투두로 추가
+                            </button>
+                          </div>
                         ))}
                       </div>
                     </div>
@@ -2735,7 +2772,7 @@ export default function Home() {
             <section className="rounded-3xl bg-white p-5 shadow-sm">
               <p className="text-sm font-semibold">목표 연결 기록</p>
               <p className="text-xs text-slate-400">
-                기록을 목표에 연결하면 진행률에 반영돼요.
+                실행한 것을 기록하면 성장 진행률에 반영돼요.
               </p>
               <div className="mt-4 space-y-2">
                 <textarea
