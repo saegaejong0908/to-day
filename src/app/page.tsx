@@ -1802,6 +1802,23 @@ export default function Home() {
     }
   };
 
+  const handleDeleteYearGoal = async () => {
+    if (!user || !db || !selectedGoalId) return;
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm("선택한 목표를 삭제할까요?");
+      if (!confirmed) return;
+    }
+    try {
+      const goalRef = doc(db, "users", user.uid, "yearGoals", selectedGoalId);
+      await deleteDoc(goalRef);
+      setRecordGoalId((prev) => (prev === selectedGoalId ? "" : prev));
+      setSelectedGoalId(null);
+      setGoalCoachResult(null);
+    } catch {
+      // ignore goal delete failures
+    }
+  };
+
   const handleAddEvent = async () => {
     if (!user || !db || !selectedDate || !newEventTitle.trim()) return;
     const eventsRef = collection(db, "users", user.uid, "events");
@@ -2859,6 +2876,18 @@ export default function Home() {
                         </option>
                       ))}
                     </select>
+                    <button
+                      type="button"
+                      className={`mt-2 w-full rounded-xl border px-3 py-2 text-xs font-semibold ${
+                        selectedGoalId
+                          ? "border-rose-200 text-rose-500"
+                          : "border-slate-200 text-slate-300"
+                      }`}
+                      onClick={handleDeleteYearGoal}
+                      disabled={!selectedGoalId}
+                    >
+                      목표 삭제
+                    </button>
                   </div>
                 )}
 
