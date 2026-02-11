@@ -75,12 +75,11 @@ type DayLog = {
   reviewedAt?: unknown | null;
 };
 
-type GoalRoadmapDraft = {
-  marchGoal: string;
-  juneGoal: string;
-  septemberGoal: string;
-  monthlyPlan: string[];
-  aiTodos: string[];
+type GoalCoachMode = "SPECIFY" | "REALITY_CHECK" | "BREAK_DOWN";
+
+type GoalCoachResult = {
+  questions: string[];
+  suggestion: string;
 };
 
 type TodoItem = {
@@ -501,13 +500,36 @@ export default function Home() {
   );
   const [todoAIError, setTodoAIError] = useState<Record<string, string>>({});
   const [yearGoals, setYearGoals] = useState<YearGoal[]>([]);
-  const [goalTitle, setGoalTitle] = useState("");
-  const [goalCategory, setGoalCategory] = useState("학습");
-  const [goalGenerating, setGoalGenerating] = useState(false);
-  const [goalGenerateError, setGoalGenerateError] = useState("");
+  const [yearGoalInput, setYearGoalInput] = useState("");
+  const [currentStatusInput, setCurrentStatusInput] = useState("");
+  const [dailyAvailableTimeInput, setDailyAvailableTimeInput] = useState("");
+  const [weakestAreaInput, setWeakestAreaInput] = useState("");
+  const [positionNoteInput, setPositionNoteInput] = useState("");
+  const [threeMonthGoalInput, setThreeMonthGoalInput] = useState("");
+  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
+  const [goalSaving, setGoalSaving] = useState(false);
+  const [goalSaveError, setGoalSaveError] = useState("");
+  const [goalCoachResult, setGoalCoachResult] = useState<GoalCoachResult | null>(
+    null
+  );
+  const [goalCoachError, setGoalCoachError] = useState("");
+  const [goalCoachLoading, setGoalCoachLoading] = useState<
+    Record<GoalCoachMode, boolean>
+  >({
+    SPECIFY: false,
+    REALITY_CHECK: false,
+    BREAK_DOWN: false,
+  });
+  const [todoModalOpen, setTodoModalOpen] = useState(false);
+  const [todoDraftText, setTodoDraftText] = useState("");
+  const [todoPolishLoading, setTodoPolishLoading] = useState(false);
+  const [todoPolishError, setTodoPolishError] = useState("");
   const [recordDraft, setRecordDraft] = useState("");
   const [recordGoalId, setRecordGoalId] = useState<string>("");
   const [recordsThisMonth, setRecordsThisMonth] = useState<RecordItem[]>([]);
+  const [logSection, setLogSection] = useState<"daily" | "goal" | "record">(
+    "daily"
+  );
 
   const buildTime = process.env.NEXT_PUBLIC_BUILD_TIME ?? "";
 
@@ -516,7 +538,7 @@ export default function Home() {
   const isTimerActive = timerSeconds !== null;
   const monthKey = getMonthKey(currentMonth);
   const modalOpen = Boolean(
-    pendingAppId || selectedDate || isTimerActive || effectModalTodo
+    pendingAppId || selectedDate || isTimerActive || effectModalTodo || todoModalOpen
   );
   const selectedEffectCount = Object.keys(effectSelections).length;
   const todayEffectCount = effectState.byDate[todayKey]?.length ?? 0;
@@ -547,13 +569,39 @@ export default function Home() {
   }, [recordsThisMonth]);
   const goalsWithProgress = useMemo(() => {
     return yearGoals.map((goal) => {
-      const totalSteps = goal.roadmap.monthlyPlan.length;
+      const totalSteps = goal.threeMonthGoal
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean).length;
       const doneCount = recordsByGoalId[goal.id] ?? 0;
-      const progress = totalSteps > 0 ? Math.min(100, Math.round((doneCount / totalSteps) * 100)) : 0;
+      const progress =
+        totalSteps > 0 ? Math.min(100, Math.round((doneCount / totalSteps) * 100)) : 0;
       return { ...goal, progress };
     });
   }, [yearGoals, recordsByGoalId]);
   const thisMonthRecordCount = recordsThisMonth.length;
+
+  useEffect(() => {
+    if (yearGoals.length === 0) {
+      setSelectedGoalId(null);
+      return;
+    }
+    if (selectedGoalId && yearGoals.some((goal) => goal.id === selectedGoalId)) return;
+    setSelectedGoalId(yearGoals[0].id);
+  }, [yearGoals, selectedGoalId]);
+
+  useEffect(() => {
+    if (!selectedGoalId) return;
+    const selectedGoal = yearGoals.find((goal) => goal.id === selectedGoalId);
+    if (!selectedGoal) return;
+    setYearGoalInput(selectedGoal.yearGoal);
+    setCurrentStatusInput(selectedGoal.currentPosition.currentStatus);
+    setDailyAvailableTimeInput(selectedGoal.currentPosition.dailyAvailableTime);
+    setWeakestAreaInput(selectedGoal.currentPosition.weakestArea);
+    setPositionNoteInput(selectedGoal.currentPosition.note);
+    setThreeMonthGoalInput(selectedGoal.threeMonthGoal);
+    setRecordGoalId(selectedGoal.id);
+  }, [selectedGoalId, yearGoals]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -629,8 +677,26 @@ export default function Home() {
       setYesterdayExists(false);
       setTodos([]);
       setYearGoals([]);
-      setGoalGenerating(false);
-      setGoalGenerateError("");
+      setYearGoalInput("");
+      setCurrentStatusInput("");
+      setDailyAvailableTimeInput("");
+      setWeakestAreaInput("");
+      setPositionNoteInput("");
+      setThreeMonthGoalInput("");
+      setSelectedGoalId(null);
+      setGoalSaving(false);
+      setGoalSaveError("");
+      setGoalCoachResult(null);
+      setGoalCoachError("");
+      setGoalCoachLoading({
+        SPECIFY: false,
+        REALITY_CHECK: false,
+        BREAK_DOWN: false,
+      });
+      setTodoModalOpen(false);
+      setTodoDraftText("");
+      setTodoPolishLoading(false);
+      setTodoPolishError("");
       setRecordsThisMonth([]);
       return;
     }
@@ -811,7 +877,6 @@ export default function Home() {
     const unsubscribeGoals = onSnapshot(goalsQuery, (snapshot) => {
       const nextGoals: YearGoal[] = snapshot.docs.map((item) => {
         const data = item.data() as Partial<YearGoal>;
-        const roadmap = (data.roadmap ?? {}) as Partial<YearGoal["roadmap"]>;
         const createdAt =
           typeof (data.createdAt as unknown as { toDate?: () => Date })?.toDate ===
           "function"
@@ -819,33 +884,50 @@ export default function Home() {
             : data.createdAt instanceof Date
               ? data.createdAt
               : new Date();
+        const legacyRoadmap = (data as unknown as {
+          roadmap?: { monthlyPlan?: string[] };
+          title?: string;
+          yearlyTarget?: string;
+        }).roadmap;
+        const legacyTitle = (data as unknown as { title?: string }).title;
+        const legacyYearlyTarget = (data as unknown as { yearlyTarget?: string })
+          .yearlyTarget;
+        const yearGoal =
+          typeof data.yearGoal === "string"
+            ? data.yearGoal
+            : typeof legacyTitle === "string"
+              ? legacyTitle
+              : typeof legacyYearlyTarget === "string"
+                ? legacyYearlyTarget
+                : "";
+        const threeMonthGoal =
+          typeof data.threeMonthGoal === "string"
+            ? data.threeMonthGoal
+            : Array.isArray(legacyRoadmap?.monthlyPlan)
+              ? legacyRoadmap?.monthlyPlan.join("\n")
+              : "";
+        const currentPositionRaw = (data.currentPosition ?? {}) as Partial<
+          YearGoal["currentPosition"]
+        >;
         return {
           id: item.id,
-          title: typeof data.title === "string" ? data.title : "",
-          category: typeof data.category === "string" ? data.category : "",
-          yearlyTarget:
-            typeof data.yearlyTarget === "string" ? data.yearlyTarget : "",
-          roadmap: {
-            marchGoal:
-              typeof roadmap.marchGoal === "string" ? roadmap.marchGoal : "",
-            juneGoal: typeof roadmap.juneGoal === "string" ? roadmap.juneGoal : "",
-            septemberGoal:
-              typeof roadmap.septemberGoal === "string"
-                ? roadmap.septemberGoal
+          yearGoal,
+          currentPosition: {
+            currentStatus:
+              typeof currentPositionRaw.currentStatus === "string"
+                ? currentPositionRaw.currentStatus
                 : "",
-            monthlyPlan: Array.isArray(roadmap.monthlyPlan)
-              ? roadmap.monthlyPlan
-                  .filter((plan): plan is string => typeof plan === "string")
-                  .map((plan) => plan.trim())
-                  .filter(Boolean)
-              : [],
+            dailyAvailableTime:
+              typeof currentPositionRaw.dailyAvailableTime === "string"
+                ? currentPositionRaw.dailyAvailableTime
+                : "",
+            weakestArea:
+              typeof currentPositionRaw.weakestArea === "string"
+                ? currentPositionRaw.weakestArea
+                : "",
+            note: typeof currentPositionRaw.note === "string" ? currentPositionRaw.note : "",
           },
-          aiTodos: Array.isArray(data.aiTodos)
-            ? data.aiTodos
-                .filter((todo): todo is string => typeof todo === "string")
-                .map((todo) => todo.trim())
-                .filter(Boolean)
-            : [],
+          threeMonthGoal,
           progress: typeof data.progress === "number" ? data.progress : 0,
           createdAt,
         };
@@ -1571,84 +1653,135 @@ export default function Home() {
     }
   };
 
-  const generateGoalRoadmap = async (
-    nextGoalTitle: string,
-    nextCategory: string
-  ): Promise<GoalRoadmapDraft | null> => {
-    try {
-      const response = await fetch("/api/ai/generate-goal-roadmap", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          goalTitle: nextGoalTitle,
-          category: nextCategory,
-        }),
-      });
-      if (!response.ok) return null;
-      const data = (await response.json()) as {
-        result?: GoalRoadmapDraft | null;
-      };
-      const result = data.result ?? null;
-      if (!result) return null;
-      if (
-        typeof result.marchGoal !== "string" ||
-        typeof result.juneGoal !== "string" ||
-        typeof result.septemberGoal !== "string" ||
-        !Array.isArray(result.monthlyPlan) ||
-        !Array.isArray(result.aiTodos)
-      ) {
-        return null;
-      }
-      return {
-        marchGoal: result.marchGoal,
-        juneGoal: result.juneGoal,
-        septemberGoal: result.septemberGoal,
-        monthlyPlan: result.monthlyPlan,
-        aiTodos: result.aiTodos,
-      };
-    } catch {
-      return null;
-    }
-  };
-
-  const handleGenerateGoalRoadmap = async () => {
+  const handleSaveGoalFields = async () => {
     if (!user || !db) return;
-    const trimmedTitle = goalTitle.trim();
-    const trimmedCategory = goalCategory.trim();
-    if (!trimmedTitle || !trimmedCategory) return;
-
-    setGoalGenerating(true);
-    setGoalGenerateError("");
-
-    const roadmap = await generateGoalRoadmap(trimmedTitle, trimmedCategory);
-    if (!roadmap) {
-      setGoalGenerateError("AI 로드맵 생성에 실패했어요. 다시 시도해 주세요.");
-      setGoalGenerating(false);
+    const yearGoal = yearGoalInput.trim();
+    if (!yearGoal) {
+      setGoalSaveError("1년 목표를 먼저 입력해 주세요.");
       return;
     }
 
+    setGoalSaving(true);
+    setGoalSaveError("");
     try {
-      const goalsRef = collection(db, "users", user.uid, "yearGoals");
-      await addDoc(goalsRef, {
-        title: trimmedTitle,
-        category: trimmedCategory,
-        yearlyTarget: trimmedTitle,
-        roadmap: {
-          marchGoal: roadmap.marchGoal,
-          juneGoal: roadmap.juneGoal,
-          septemberGoal: roadmap.septemberGoal,
-          monthlyPlan: roadmap.monthlyPlan,
+      const payload = {
+        yearGoal,
+        currentPosition: {
+          currentStatus: currentStatusInput.trim(),
+          dailyAvailableTime: dailyAvailableTimeInput.trim(),
+          weakestArea: weakestAreaInput.trim(),
+          note: positionNoteInput.trim(),
         },
-        aiTodos: roadmap.aiTodos,
-        progress: 0,
-        createdAt: serverTimestamp(),
-      });
-      setGoalTitle("");
+        threeMonthGoal: threeMonthGoalInput.trim(),
+        updatedAt: serverTimestamp(),
+      };
+
+      if (selectedGoalId) {
+        const goalRef = doc(db, "users", user.uid, "yearGoals", selectedGoalId);
+        await setDoc(goalRef, payload, { merge: true });
+      } else {
+        const goalsRef = collection(db, "users", user.uid, "yearGoals");
+        const ref = await addDoc(goalsRef, {
+          ...payload,
+          progress: 0,
+          createdAt: serverTimestamp(),
+        });
+        setSelectedGoalId(ref.id);
+        setRecordGoalId(ref.id);
+      }
     } catch {
-      setGoalGenerateError("목표 저장에 실패했어요. 다시 시도해 주세요.");
+      setGoalSaveError("목표 저장에 실패했어요. 다시 시도해 주세요.");
     } finally {
-      setGoalGenerating(false);
+      setGoalSaving(false);
     }
+  };
+
+  const handleGoalCoach = async (mode: GoalCoachMode) => {
+    const yearGoal = yearGoalInput.trim();
+    const threeMonthGoal = threeMonthGoalInput.trim();
+    if (!yearGoal || !threeMonthGoal) {
+      setGoalCoachError("1년 목표와 3개월 목표를 먼저 작성해 주세요.");
+      return;
+    }
+
+    setGoalCoachError("");
+    setGoalCoachResult(null);
+    setGoalCoachLoading((prev) => ({ ...prev, [mode]: true }));
+    try {
+      const response = await fetch("/api/ai/goal-coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          yearGoal,
+          currentStatus: currentStatusInput.trim(),
+          dailyAvailableTime: dailyAvailableTimeInput.trim(),
+          weakestArea: weakestAreaInput.trim(),
+          note: positionNoteInput.trim(),
+          threeMonthGoal,
+        }),
+      });
+      if (!response.ok) {
+        setGoalCoachError("AI 코치 응답을 가져오지 못했어요.");
+        return;
+      }
+      const data = (await response.json()) as {
+        result?: GoalCoachResult | null;
+      };
+      if (!data.result) {
+        setGoalCoachError("AI 코치 응답이 비어 있어요.");
+        return;
+      }
+      setGoalCoachResult({
+        questions: data.result.questions.slice(0, 3),
+        suggestion: data.result.suggestion,
+      });
+    } catch {
+      setGoalCoachError("AI 코치 호출 중 오류가 발생했어요.");
+    } finally {
+      setGoalCoachLoading((prev) => ({ ...prev, [mode]: false }));
+    }
+  };
+
+  const handlePolishTodoDraft = async () => {
+    const rawTodo = todoDraftText.trim();
+    if (!rawTodo) return;
+    setTodoPolishLoading(true);
+    setTodoPolishError("");
+    try {
+      const response = await fetch("/api/ai/polish-todo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawTodo }),
+      });
+      if (!response.ok) {
+        setTodoPolishError("문장 다듬기에 실패했어요.");
+        return;
+      }
+      const data = (await response.json()) as {
+        result?: { polishedTodo: string } | null;
+      };
+      const polishedTodo = data.result?.polishedTodo?.trim() ?? "";
+      if (!polishedTodo) {
+        setTodoPolishError("다듬은 문장을 받지 못했어요.");
+        return;
+      }
+      setTodoDraftText(polishedTodo);
+    } catch {
+      setTodoPolishError("문장 다듬기 중 오류가 발생했어요.");
+    } finally {
+      setTodoPolishLoading(false);
+    }
+  };
+
+  const handleSubmitGoalTodo = async () => {
+    const text = todoDraftText.trim();
+    if (!text) return;
+    const goalIdForTodo = selectedGoalId ?? (recordGoalId || undefined);
+    await handleAddAiTodoAsTodo(text, goalIdForTodo);
+    setTodoDraftText("");
+    setTodoPolishError("");
+    setTodoModalOpen(false);
   };
 
   const handleAddRecordItem = async () => {
@@ -1663,7 +1796,7 @@ export default function Home() {
         createdAt: serverTimestamp(),
       });
       setRecordDraft("");
-      setRecordGoalId("");
+      setRecordGoalId(selectedGoalId ?? "");
     } catch {
       // ignore record save failures
     }
@@ -2221,14 +2354,21 @@ export default function Home() {
                   >
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-sm font-semibold text-slate-900">
-                        {goal.title}
+                        {goal.yearGoal}
                       </p>
                       <span className="text-xs font-semibold text-slate-600">
                         {goal.progress}%
                       </span>
                     </div>
                     <p className="mt-1 text-[11px] text-slate-400">
-                      {goal.category} · 월간 계획 {goal.roadmap.monthlyPlan.length}개
+                      3개월 목표 단위{" "}
+                      {
+                        goal.threeMonthGoal
+                          .split("\n")
+                          .map((item) => item.trim())
+                          .filter(Boolean).length
+                      }
+                      개
                     </p>
                     <div className="mt-2 h-2 w-full rounded-full bg-slate-100">
                       <div
@@ -2236,11 +2376,15 @@ export default function Home() {
                         style={{ width: `${goal.progress}%` }}
                       />
                     </div>
-                    {goal.progress < 30 && goal.roadmap.monthlyPlan.length > 0 && (
+                    {goal.progress < 30 &&
+                      goal.threeMonthGoal.trim().length > 0 && (
                       <button
                         type="button"
                         className="mt-2 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600"
-                        onClick={() => setActiveTab("log")}
+                        onClick={() => {
+                          setActiveTab("log");
+                          setLogSection("goal");
+                        }}
                       >
                         정체기 극복하기 →
                       </button>
@@ -2609,267 +2753,337 @@ export default function Home() {
             <section className="rounded-3xl bg-white p-4 shadow-sm">
               <p className="text-xs font-semibold text-slate-500">기록 탭 가이드</p>
               <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
-                <a
-                  href="#daily-record-section"
-                  className="rounded-xl border border-slate-200 px-2 py-2 text-center font-semibold text-slate-600"
+                <button
+                  type="button"
+                  onClick={() => setLogSection("daily")}
+                  className={`rounded-xl border px-2 py-2 text-center font-semibold ${
+                    logSection === "daily"
+                      ? "border-slate-900 bg-slate-900 text-white"
+                      : "border-slate-200 text-slate-600"
+                  }`}
                 >
                   오늘 기록
-                </a>
-                <a
-                  href="#year-goal-section"
-                  className="rounded-xl border border-slate-200 px-2 py-2 text-center font-semibold text-slate-600"
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLogSection("goal")}
+                  className={`rounded-xl border px-2 py-2 text-center font-semibold ${
+                    logSection === "goal"
+                      ? "border-slate-900 bg-slate-900 text-white"
+                      : "border-slate-200 text-slate-600"
+                  }`}
                 >
                   목표 설계
-                </a>
-                <a
-                  href="#goal-record-section"
-                  className="rounded-xl border border-slate-200 px-2 py-2 text-center font-semibold text-slate-600"
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLogSection("record")}
+                  className={`rounded-xl border px-2 py-2 text-center font-semibold ${
+                    logSection === "record"
+                      ? "border-slate-900 bg-slate-900 text-white"
+                      : "border-slate-200 text-slate-600"
+                  }`}
                 >
                   실행 기록
-                </a>
-              </div>
-            </section>
-
-            <section
-              id="daily-record-section"
-              className="rounded-3xl bg-white p-5 shadow-sm"
-            >
-              <p className="text-sm font-semibold">오늘 기록</p>
-              <p className="text-xs text-slate-400">
-                하루가 끝나기 전에 오늘을 정리해요.
-              </p>
-              <div className="mt-4 space-y-4 text-sm">
-                <label className="block">
-                  <span className="text-xs text-slate-400">오늘 한 일</span>
-                  <textarea
-                    value={todayDraft.did}
-                    onChange={(event) =>
-                      setTodayDraft((prev) => ({
-                        ...prev,
-                        did: event.target.value,
-                      }))
-                    }
-                    rows={3}
-                    className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                    placeholder="예) 오전 독서 30분, 운동 20분"
-                  />
-                </label>
-                <label className="block">
-                  <span className="text-xs text-slate-400">오늘 배운 것</span>
-                  <textarea
-                    value={todayDraft.learned}
-                    onChange={(event) =>
-                      setTodayDraft((prev) => ({
-                        ...prev,
-                        learned: event.target.value,
-                      }))
-                    }
-                    rows={3}
-                    className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                    placeholder="예) 집중할 때는 알림을 꺼두면 좋다"
-                  />
-                </label>
-              </div>
-              <button
-                className="mt-4 w-full rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white"
-                onClick={handleSaveLog}
-              >
-                기록 저장
-              </button>
-            </section>
-
-            <section
-              id="year-goal-section"
-              className="rounded-3xl bg-white p-5 shadow-sm"
-            >
-              <p className="text-sm font-semibold">1년 목표</p>
-              <p className="text-xs text-slate-400">
-                목표를 입력하면 전략과 실행 구조가 자동으로 만들어져요.
-              </p>
-              <div className="mt-4 space-y-2 text-sm">
-                <input
-                  value={goalTitle}
-                  onChange={(event) => setGoalTitle(event.target.value)}
-                  placeholder="예) 웹개발 역량을 수치로 올리기"
-                  className="w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-                />
-                <select
-                  value={goalCategory}
-                  onChange={(event) => setGoalCategory(event.target.value)}
-                  className="w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-                >
-                  {["학습", "운동", "건강", "일", "관계", "재정", "기타"].map(
-                    (category) => (
-                      <option key={category} value={category}>
-                        {category}
-                      </option>
-                    )
-                  )}
-                </select>
-                <button
-                  className={`w-full rounded-full px-4 py-2 text-xs font-semibold ${
-                    goalGenerating || !goalTitle.trim()
-                      ? "bg-slate-200 text-slate-400"
-                      : "bg-slate-900 text-white"
-                  }`}
-                  onClick={handleGenerateGoalRoadmap}
-                  disabled={goalGenerating || !goalTitle.trim()}
-                >
-                  {goalGenerating ? "생성 중..." : "AI 로드맵 생성"}
                 </button>
-                {goalGenerateError && (
-                  <p className="text-xs text-rose-500">{goalGenerateError}</p>
-                )}
               </div>
+            </section>
 
-              <div className="mt-4 space-y-3">
-                {goalsWithProgress.length === 0 && (
-                  <p className="text-xs text-slate-400">
-                    아직 저장된 목표가 없어요.
-                  </p>
+            {logSection === "daily" && (
+              <section className="rounded-3xl bg-white p-5 shadow-sm">
+                <p className="text-sm font-semibold">오늘 기록</p>
+                <p className="text-xs text-slate-400">
+                  하루가 끝나기 전에 오늘을 정리해요.
+                </p>
+                <div className="mt-4 space-y-4 text-sm">
+                  <label className="block">
+                    <span className="text-xs text-slate-400">오늘 한 일</span>
+                    <textarea
+                      value={todayDraft.did}
+                      onChange={(event) =>
+                        setTodayDraft((prev) => ({
+                          ...prev,
+                          did: event.target.value,
+                        }))
+                      }
+                      rows={3}
+                      className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
+                      placeholder="예) 오전 독서 30분, 운동 20분"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs text-slate-400">오늘 배운 것</span>
+                    <textarea
+                      value={todayDraft.learned}
+                      onChange={(event) =>
+                        setTodayDraft((prev) => ({
+                          ...prev,
+                          learned: event.target.value,
+                        }))
+                      }
+                      rows={3}
+                      className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
+                      placeholder="예) 집중할 때는 알림을 꺼두면 좋다"
+                    />
+                  </label>
+                </div>
+                <button
+                  className="mt-4 w-full rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white"
+                  onClick={handleSaveLog}
+                >
+                  기록 저장
+                </button>
+              </section>
+            )}
+
+            {logSection === "goal" && (
+              <section className="rounded-3xl bg-white p-5 shadow-sm">
+                <p className="text-sm font-semibold">사용자 설계 + AI 코치</p>
+                <p className="text-xs text-slate-400">
+                  목표는 사용자가 설계하고, AI는 질문과 한 줄 제안만 제공합니다.
+                </p>
+
+                {yearGoals.length > 0 && (
+                  <div className="mt-4">
+                    <p className="text-[11px] text-slate-400">불러올 목표</p>
+                    <select
+                      value={selectedGoalId ?? ""}
+                      onChange={(event) =>
+                        setSelectedGoalId(event.target.value || null)
+                      }
+                      className="mt-1 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                    >
+                      {yearGoals.map((goal) => (
+                        <option key={goal.id} value={goal.id}>
+                          {goal.yearGoal || "제목 없는 목표"}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 )}
-                {goalsWithProgress.map((goal) => (
-                  <details
-                    key={goal.id}
-                    className="rounded-3xl border border-slate-100 bg-slate-50 p-4"
-                  >
-                    <summary className="cursor-pointer list-none">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-semibold text-slate-900">
-                            {goal.title}
-                          </p>
-                          <p className="mt-1 text-[11px] text-slate-400">
-                            {goal.category} · 진행 {goal.progress}%
-                          </p>
-                        </div>
-                        <div className="text-right">
-                          <p className="text-xs font-semibold text-slate-600">
-                            {goal.progress}%
-                          </p>
-                          <p className="mt-1 text-[10px] text-slate-400">
-                            펼쳐서 상세보기
-                          </p>
-                        </div>
-                      </div>
-                    </summary>
-                    <div className="mt-3 h-2 w-full rounded-full bg-white">
-                      <div
-                        className="h-2 rounded-full bg-slate-900"
-                        style={{ width: `${goal.progress}%` }}
+
+                <div className="mt-4 space-y-4">
+                  <div className="rounded-2xl border border-slate-100 p-3">
+                    <p className="text-xs font-semibold">🎯 1년 목표</p>
+                    <textarea
+                      value={yearGoalInput}
+                      onChange={(event) => setYearGoalInput(event.target.value)}
+                      rows={3}
+                      className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
+                      placeholder="예) 1년 안에 실무 수준의 프론트엔드 포트폴리오 3개 완성"
+                    />
+                    <button
+                      type="button"
+                      className={`mt-2 w-full rounded-full px-4 py-2 text-xs font-semibold ${
+                        goalSaving || !yearGoalInput.trim()
+                          ? "bg-slate-200 text-slate-400"
+                          : "bg-slate-900 text-white"
+                      }`}
+                      onClick={handleSaveGoalFields}
+                      disabled={goalSaving || !yearGoalInput.trim()}
+                    >
+                      {goalSaving ? "저장 중..." : "저장"}
+                    </button>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-100 p-3">
+                    <p className="text-xs font-semibold">📍 현재 위치</p>
+                    <div className="mt-2 grid gap-2">
+                      <input
+                        value={currentStatusInput}
+                        onChange={(event) =>
+                          setCurrentStatusInput(event.target.value)
+                        }
+                        className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                        placeholder="현재 점수 / 현재 상태"
+                      />
+                      <input
+                        value={dailyAvailableTimeInput}
+                        onChange={(event) =>
+                          setDailyAvailableTimeInput(event.target.value)
+                        }
+                        className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                        placeholder="하루 가능 시간"
+                      />
+                      <input
+                        value={weakestAreaInput}
+                        onChange={(event) => setWeakestAreaInput(event.target.value)}
+                        className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                        placeholder="가장 약한 영역"
+                      />
+                      <textarea
+                        value={positionNoteInput}
+                        onChange={(event) => setPositionNoteInput(event.target.value)}
+                        rows={2}
+                        className="rounded-2xl border border-slate-200 p-3 text-sm"
+                        placeholder="자유 메모"
                       />
                     </div>
-                    <div className="mt-4 grid gap-2 text-xs text-slate-600">
-                      <div className="rounded-2xl bg-white p-3">
-                        <p className="text-[11px] text-slate-400">3월</p>
-                        <p className="mt-1">{goal.roadmap.marchGoal}</p>
-                      </div>
-                      <div className="rounded-2xl bg-white p-3">
-                        <p className="text-[11px] text-slate-400">6월</p>
-                        <p className="mt-1">{goal.roadmap.juneGoal}</p>
-                      </div>
-                      <div className="rounded-2xl bg-white p-3">
-                        <p className="text-[11px] text-slate-400">9월</p>
-                        <p className="mt-1">{goal.roadmap.septemberGoal}</p>
-                      </div>
-                    </div>
-                    <div className="mt-4 rounded-2xl bg-white p-3">
-                      <p className="text-[11px] text-slate-400">월간 계획</p>
-                      <div className="mt-2 space-y-1 text-xs text-slate-600">
-                        {goal.roadmap.monthlyPlan.map((plan) => (
-                          <p key={plan}>· {plan}</p>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="mt-3 rounded-2xl bg-white p-3">
-                      <p className="text-[11px] text-slate-400">실행 가능한 투두 3개</p>
-                      <div className="mt-2 space-y-2 text-xs text-slate-600">
-                        {goal.aiTodos.map((todo) => (
-                          <div
-                            key={todo}
-                            className="flex items-center justify-between gap-2 rounded-xl bg-slate-50 px-2 py-1.5"
-                          >
-                            <span>· {todo}</span>
-                            <button
-                              type="button"
-                              className="rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-semibold text-slate-600"
-                              onClick={() => handleAddAiTodoAsTodo(todo, goal.id)}
-                            >
-                              오늘 투두로 추가
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </details>
-                ))}
-              </div>
-            </section>
+                  </div>
 
-            <section
-              id="goal-record-section"
-              className="rounded-3xl bg-white p-5 shadow-sm"
-            >
-              <p className="text-sm font-semibold">목표 연결 기록</p>
-              <p className="text-xs text-slate-400">
-                실행한 것을 기록하면 성장 진행률에 반영돼요.
-              </p>
-              <div className="mt-4 space-y-2">
-                <textarea
-                  value={recordDraft}
-                  onChange={(event) => setRecordDraft(event.target.value)}
-                  rows={2}
-                  className="w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                  placeholder="예) 핵심 자료 1개 저장"
-                />
-                <select
-                  value={recordGoalId}
-                  onChange={(event) => setRecordGoalId(event.target.value)}
-                  className="w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-                >
-                  <option value="">목표 선택(선택 안 함)</option>
-                  {yearGoals.map((goal) => (
-                    <option key={goal.id} value={goal.id}>
-                      {goal.title}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className={`w-full rounded-full px-4 py-2 text-xs font-semibold ${
-                    recordDraft.trim()
-                      ? "bg-slate-900 text-white"
-                      : "bg-slate-200 text-slate-400"
-                  }`}
-                  onClick={handleAddRecordItem}
-                  disabled={!recordDraft.trim()}
-                >
-                  기록 추가
-                </button>
-              </div>
+                  <div className="rounded-2xl border border-slate-100 p-3">
+                    <p className="text-xs font-semibold">🗓 3개월 목표</p>
+                    <textarea
+                      value={threeMonthGoalInput}
+                      onChange={(event) =>
+                        setThreeMonthGoalInput(event.target.value)
+                      }
+                      rows={4}
+                      className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
+                      placeholder="예) 주 5회, 하루 1시간 학습 / 12주 동안 미니 프로젝트 3개"
+                    />
+                    <div className="mt-3 grid grid-cols-1 gap-2 text-xs">
+                      <button
+                        type="button"
+                        className="rounded-xl border border-slate-200 px-3 py-2 font-semibold text-slate-700"
+                        onClick={() => handleGoalCoach("SPECIFY")}
+                        disabled={goalCoachLoading.SPECIFY}
+                      >
+                        {goalCoachLoading.SPECIFY
+                          ? "질문 생성 중..."
+                          : "구체화 도움 받기"}
+                      </button>
+                      <button
+                        type="button"
+                        className="rounded-xl border border-slate-200 px-3 py-2 font-semibold text-slate-700"
+                        onClick={() => handleGoalCoach("REALITY_CHECK")}
+                        disabled={goalCoachLoading.REALITY_CHECK}
+                      >
+                        {goalCoachLoading.REALITY_CHECK
+                          ? "질문 생성 중..."
+                          : "현실성 체크"}
+                      </button>
+                      <button
+                        type="button"
+                        className="rounded-xl border border-slate-200 px-3 py-2 font-semibold text-slate-700"
+                        onClick={() => handleGoalCoach("BREAK_DOWN")}
+                        disabled={goalCoachLoading.BREAK_DOWN}
+                      >
+                        {goalCoachLoading.BREAK_DOWN
+                          ? "질문 생성 중..."
+                          : "실행 단위로 나누기"}
+                      </button>
+                    </div>
 
-              <div className="mt-4 space-y-2">
-                {recordsThisMonth.length === 0 && (
-                  <p className="text-xs text-slate-400">
-                    이번 달 기록이 아직 없어요.
-                  </p>
-                )}
-                {recordsThisMonth.slice(0, 8).map((record) => {
-                  const linkedGoal = yearGoals.find((goal) => goal.id === record.goalId);
-                  return (
-                    <div
-                      key={record.id}
-                      className="rounded-2xl border border-slate-100 px-3 py-2"
+                    <button
+                      type="button"
+                      className="mt-3 w-full rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white"
+                      onClick={() => {
+                        setTodoDraftText("");
+                        setTodoPolishError("");
+                        setTodoModalOpen(true);
+                      }}
                     >
-                      <p className="text-sm text-slate-800">{record.content}</p>
-                      <p className="mt-1 text-[11px] text-slate-400">
-                        {linkedGoal ? linkedGoal.title : "목표 미선택"} ·{" "}
-                        {record.createdAt.toLocaleString()}
-                      </p>
+                      오늘 투두로 추가
+                    </button>
+                    <button
+                      type="button"
+                      className={`mt-2 w-full rounded-full px-4 py-2 text-xs font-semibold ${
+                        goalSaving || !yearGoalInput.trim()
+                          ? "bg-slate-200 text-slate-400"
+                          : "bg-white text-slate-700 border border-slate-200"
+                      }`}
+                      onClick={handleSaveGoalFields}
+                      disabled={goalSaving || !yearGoalInput.trim()}
+                    >
+                      {goalSaving ? "저장 중..." : "설계 저장"}
+                    </button>
+                  </div>
+                </div>
+
+                {goalSaveError && (
+                  <p className="mt-3 text-xs text-rose-500">{goalSaveError}</p>
+                )}
+                {goalCoachError && (
+                  <p className="mt-2 text-xs text-rose-500">{goalCoachError}</p>
+                )}
+
+                {goalCoachResult && (
+                  <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50 p-3">
+                    <p className="text-xs font-semibold text-slate-700">
+                      🧠 생각을 돕는 질문
+                    </p>
+                    <div className="mt-2 space-y-1 text-xs text-slate-600">
+                      {goalCoachResult.questions.map((question) => (
+                        <p key={question}>- {question}</p>
+                      ))}
                     </div>
-                  );
-                })}
-              </div>
-            </section>
+                    <p className="mt-3 text-xs font-semibold text-slate-700">
+                      💡 한 줄 제안
+                    </p>
+                    <p className="mt-1 text-xs text-slate-600">
+                      {goalCoachResult.suggestion}
+                    </p>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {logSection === "record" && (
+              <section className="rounded-3xl bg-white p-5 shadow-sm">
+                <p className="text-sm font-semibold">목표 연결 기록</p>
+                <p className="text-xs text-slate-400">
+                  실행한 것을 기록하면 성장 진행률에 반영돼요.
+                </p>
+                <div className="mt-4 space-y-2">
+                  <textarea
+                    value={recordDraft}
+                    onChange={(event) => setRecordDraft(event.target.value)}
+                    rows={2}
+                    className="w-full rounded-2xl border border-slate-200 p-3 text-sm"
+                    placeholder="예) 핵심 자료 1개 저장"
+                  />
+                  <select
+                    value={recordGoalId}
+                    onChange={(event) => setRecordGoalId(event.target.value)}
+                    className="w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                  >
+                    <option value="">목표 선택(선택 안 함)</option>
+                    {yearGoals.map((goal) => (
+                      <option key={goal.id} value={goal.id}>
+                        {goal.yearGoal || "제목 없는 목표"}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className={`w-full rounded-full px-4 py-2 text-xs font-semibold ${
+                      recordDraft.trim()
+                        ? "bg-slate-900 text-white"
+                        : "bg-slate-200 text-slate-400"
+                    }`}
+                    onClick={handleAddRecordItem}
+                    disabled={!recordDraft.trim()}
+                  >
+                    기록 추가
+                  </button>
+                </div>
+
+                <div className="mt-4 space-y-2">
+                  {recordsThisMonth.length === 0 && (
+                    <p className="text-xs text-slate-400">
+                      이번 달 기록이 아직 없어요.
+                    </p>
+                  )}
+                  {recordsThisMonth.slice(0, 8).map((record) => {
+                    const linkedGoal = yearGoals.find(
+                      (goal) => goal.id === record.goalId
+                    );
+                    return (
+                      <div
+                        key={record.id}
+                        className="rounded-2xl border border-slate-100 px-3 py-2"
+                      >
+                        <p className="text-sm text-slate-800">{record.content}</p>
+                        <p className="mt-1 text-[11px] text-slate-400">
+                          {linkedGoal ? linkedGoal.yearGoal : "목표 미선택"} ·{" "}
+                          {record.createdAt.toLocaleString()}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
           </>
         )}
 
@@ -3204,6 +3418,60 @@ export default function Home() {
           ))}
         </div>
       </nav>
+
+      {todoModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 px-6">
+          <div className="w-full max-w-sm rounded-3xl bg-white p-6 max-h-[80vh] overflow-y-auto">
+            <div className="flex items-start justify-between">
+              <div>
+                <p className="text-xs text-slate-400">오늘 투두로 추가</p>
+                <h2 className="text-lg font-semibold">실행 문장을 직접 적어주세요</h2>
+              </div>
+              <button
+                type="button"
+                className="text-xs text-slate-400"
+                onClick={() => setTodoModalOpen(false)}
+              >
+                닫기
+              </button>
+            </div>
+            <textarea
+              value={todoDraftText}
+              onChange={(event) => setTodoDraftText(event.target.value)}
+              rows={4}
+              className="mt-4 w-full rounded-2xl border border-slate-200 p-3 text-sm"
+              placeholder="예) 오늘 21:00~22:00에 포트폴리오 프로젝트 README 1개 완성"
+            />
+            <button
+              type="button"
+              className={`mt-3 w-full rounded-full px-4 py-2 text-xs font-semibold ${
+                todoPolishLoading || !todoDraftText.trim()
+                  ? "bg-slate-200 text-slate-400"
+                  : "bg-slate-900 text-white"
+              }`}
+              onClick={handlePolishTodoDraft}
+              disabled={todoPolishLoading || !todoDraftText.trim()}
+            >
+              {todoPolishLoading ? "다듬는 중..." : "✨ 투두 다듬기 AI"}
+            </button>
+            {todoPolishError && (
+              <p className="mt-2 text-xs text-rose-500">{todoPolishError}</p>
+            )}
+            <button
+              type="button"
+              className={`mt-3 w-full rounded-full px-4 py-2 text-xs font-semibold ${
+                todoDraftText.trim()
+                  ? "bg-emerald-600 text-white"
+                  : "bg-slate-200 text-slate-400"
+              }`}
+              onClick={handleSubmitGoalTodo}
+              disabled={!todoDraftText.trim()}
+            >
+              투두 추가
+            </button>
+          </div>
+        </div>
+      )}
 
       {pendingAppId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 px-6">

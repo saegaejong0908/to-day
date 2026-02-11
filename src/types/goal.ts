@@ -1,15 +1,13 @@
 export type YearGoal = {
   id: string;
-  title: string;
-  category: string;
-  yearlyTarget: string;
-  roadmap: {
-    marchGoal: string;
-    juneGoal: string;
-    septemberGoal: string;
-    monthlyPlan: string[];
+  yearGoal: string;
+  currentPosition: {
+    currentStatus: string;
+    dailyAvailableTime: string;
+    weakestArea: string;
+    note: string;
   };
-  aiTodos: string[];
+  threeMonthGoal: string;
   progress: number;
   createdAt: Date;
 };
