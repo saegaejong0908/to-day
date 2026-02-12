@@ -78,7 +78,7 @@ type DayLog = {
 type WeeklyActionTodo = {
   id: string;
   text: string;
-  weekday: number | null;
+  weekdays: number[];
 };
 
 type WeeklyActionPlanResult = {
@@ -531,6 +531,9 @@ export default function Home() {
   const [weeklyAddedFeedback, setWeeklyAddedFeedback] = useState<
     Record<string, boolean>
   >({});
+  const [weekdayPickerTodoId, setWeekdayPickerTodoId] = useState<string | null>(
+    null
+  );
   const [todoModalOpen, setTodoModalOpen] = useState(false);
   const [todoDraftText, setTodoDraftText] = useState("");
   const [todoPolishLoading, setTodoPolishLoading] = useState(false);
@@ -611,11 +614,11 @@ export default function Home() {
   ];
   const makeWeeklyActionTodo = (
     text = "",
-    weekday: number | null = null
+    weekdays: number[] = []
   ): WeeklyActionTodo => ({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     text,
-    weekday,
+    weekdays,
   });
 
   useEffect(() => {
@@ -633,6 +636,7 @@ export default function Home() {
       setWeeklyActionError("");
       setWeeklyAchievedRate(0);
       setWeeklyAddedFeedback({});
+      setWeekdayPickerTodoId(null);
       return;
     }
     if (isCreatingNewGoal) return;
@@ -659,12 +663,13 @@ export default function Home() {
         ? {
             rationale: selectedGoal.weeklyActionPlan.rationale,
             todos: selectedGoal.weeklyActionPlan.todos.map((todo) =>
-              makeWeeklyActionTodo(todo.text, todo.weekday ?? null)
+              makeWeeklyActionTodo(todo.text, todo.weekdays ?? [])
             ),
           }
         : null
     );
     setWeeklyAddedFeedback({});
+    setWeekdayPickerTodoId(null);
     setWeeklyAchievedRate(selectedGoal.weeklyActionPlan?.achievedRate ?? 0);
     setWeeklyActionError("");
     setRecordGoalId(selectedGoal.id);
@@ -982,12 +987,19 @@ export default function Home() {
           ? weeklyActionPlanRaw.todos
               .map((todo) => {
                 if (typeof todo === "string") {
-                  return makeWeeklyActionTodo(todo, null);
+                  return makeWeeklyActionTodo(todo, []);
                 }
                 if (typeof todo?.text !== "string") return null;
+                const weekdays = Array.isArray(todo.weekdays)
+                  ? todo.weekdays
+                      .filter((day): day is number => typeof day === "number")
+                      .map((day) => ((day % 7) + 7) % 7)
+                  : typeof todo.weekday === "number"
+                    ? [((todo.weekday % 7) + 7) % 7]
+                    : [];
                 return makeWeeklyActionTodo(
                   todo.text.trim(),
-                  typeof todo.weekday === "number" ? todo.weekday : null
+                  weekdays
                 );
               })
               .filter((todo): todo is WeeklyActionTodo => Boolean(todo))
@@ -1790,7 +1802,11 @@ export default function Home() {
         weeklyActionPlan: {
           weekKey: todayKey,
           rationale: weeklyActionPlan?.rationale ?? "",
-          todos: weeklyActionPlan?.todos ?? [],
+          todos:
+            weeklyActionPlan?.todos.map((todo) => ({
+              text: todo.text,
+              weekdays: todo.weekdays,
+            })) ?? [],
           achievedRate: weeklyAchievedRate,
         },
         updatedAt: serverTimestamp(),
@@ -1825,6 +1841,14 @@ export default function Home() {
       setWeeklyActionError("원하는 결과와 1주 뒤 상태를 먼저 작성해 주세요.");
       return;
     }
+    const seedTodos =
+      weeklyActionPlan?.todos
+        .map((todo) => todo.text.trim())
+        .filter(Boolean) ?? [];
+    if (seedTodos.length === 0) {
+      setWeeklyActionError("먼저 실행 항목을 직접 1개 이상 작성해 주세요.");
+      return;
+    }
 
     setWeeklyActionError("");
     setWeeklyActionLoading(true);
@@ -1835,9 +1859,10 @@ export default function Home() {
         body: JSON.stringify({
           deadlineDate: dailyAvailableTimeInput.trim(),
           desiredOutcome,
-          requiredState: currentStatusInput.trim(),
+          requiredState: `${currentStatusInput.trim()}\n중간 목표 상태: ${threeMonthGoalInput.trim()}`,
           weeklyState,
           constraints: positionNoteInput.trim() || weakestAreaInput.trim(),
+          seedTodos,
         }),
       });
       if (!response.ok) {
@@ -1853,11 +1878,15 @@ export default function Home() {
       }
       setWeeklyActionPlan({
         rationale: data.result.rationale,
-        todos: data.result.todos
-          .slice(0, 7)
-          .map((todo) => makeWeeklyActionTodo(todo, null)),
+        todos: seedTodos.map((seedTodo, index) =>
+          makeWeeklyActionTodo(
+            data.result?.todos[index]?.trim() || seedTodo,
+            weeklyActionPlan?.todos[index]?.weekdays ?? []
+          )
+        ),
       });
       setWeeklyAddedFeedback({});
+      setWeekdayPickerTodoId(null);
     } catch {
       setWeeklyActionError("실행 분해 중 오류가 발생했어요.");
     } finally {
@@ -1869,7 +1898,6 @@ export default function Home() {
     const now = new Date();
     const todayWeekday = now.getDay();
     let diff = (weekday - todayWeekday + 7) % 7;
-    if (diff === 0) diff = 7;
     const nextDate = new Date(
       now.getFullYear(),
       now.getMonth(),
@@ -1880,12 +1908,18 @@ export default function Home() {
 
   const handleAddWeeklyPlannedTodo = async (todo: WeeklyActionTodo) => {
     if (!todo.text.trim()) return;
-    if (todo.weekday === null) {
-      setWeeklyActionError("요일을 먼저 선택해 주세요.");
+    if (todo.weekdays.length === 0) {
+      setWeeklyActionError("요일을 1개 이상 선택해 주세요.");
       return;
     }
-    const targetDateKey = getNextDateKeyByWeekday(todo.weekday);
-    await handleAddAiTodoAsTodo(todo.text, selectedGoalId ?? undefined, targetDateKey);
+    const targetDateKeys = Array.from(
+      new Set(todo.weekdays.map((weekday) => getNextDateKeyByWeekday(weekday)))
+    );
+    await Promise.all(
+      targetDateKeys.map((dateKey) =>
+        handleAddAiTodoAsTodo(todo.text, selectedGoalId ?? undefined, dateKey)
+      )
+    );
     setWeeklyAddedFeedback((prev) => ({ ...prev, [todo.id]: true }));
     window.setTimeout(() => {
       setWeeklyAddedFeedback((prev) => ({ ...prev, [todo.id]: false }));
@@ -1975,6 +2009,7 @@ export default function Home() {
       setWeeklyActionError("");
       setWeeklyAchievedRate(0);
       setWeeklyAddedFeedback({});
+      setWeekdayPickerTodoId(null);
     } catch {
       // ignore goal delete failures
     }
@@ -1989,6 +2024,7 @@ export default function Home() {
     setWeeklyActionLoading(false);
     setWeeklyAchievedRate(0);
     setWeeklyAddedFeedback({});
+    setWeekdayPickerTodoId(null);
     setGoalSaveError("");
     setYearGoalInput("");
     setCurrentStatusInput("");
@@ -3193,19 +3229,25 @@ export default function Home() {
                       onClick={handleGenerateWeeklyActionPlan}
                       disabled={weeklyActionLoading}
                     >
-                      {weeklyActionLoading ? "분해 중..." : "AI 분해 도움 받기"}
+                      {weeklyActionLoading ? "보완 중..." : "AI 보완 도움 받기"}
                     </button>
                   </div>
                   <p className="mt-1 text-xs text-slate-500">
-                    직접 실행 항목을 적고, 필요할 때만 AI로 분해 도움을 받으세요.
+                    먼저 실행 항목을 직접 작성하고, AI로 표현과 순서를 보완하세요.
                   </p>
 
                   {weeklyActionError && (
                     <p className="mt-2 text-xs text-rose-500">{weeklyActionError}</p>
                   )}
 
-                  {weeklyActionPlan && (
-                    <div className="mt-3 space-y-3">
+                  <div className="mt-3 space-y-3">
+                    {!weeklyActionPlan && (
+                      <p className="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500">
+                        먼저 아래 버튼으로 실행 항목을 추가해 주세요.
+                      </p>
+                    )}
+                    {weeklyActionPlan && (
+                      <>
                       <p className="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
                         💡 {weeklyActionPlan.rationale}
                       </p>
@@ -3227,31 +3269,85 @@ export default function Home() {
                               }
                               className="flex-1 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs"
                             />
-                            <select
-                              value={todo.weekday ?? ""}
-                              onChange={(event) =>
-                                setWeeklyActionPlan((prev) => {
-                                  if (!prev) return prev;
-                                  const nextTodos = [...prev.todos];
-                                  nextTodos[index] = {
-                                    ...nextTodos[index],
-                                    weekday:
-                                      event.target.value === ""
-                                        ? null
-                                        : Number(event.target.value),
-                                  };
-                                  return { ...prev, todos: nextTodos };
-                                })
-                              }
-                              className="rounded-full border border-slate-200 bg-white px-2 py-2 text-[11px] text-slate-600"
-                            >
-                              <option value="">요일</option>
-                              {WEEKDAY_OPTIONS.map((option) => (
-                                <option key={option.value} value={option.value}>
-                                  {option.label}
-                                </option>
-                              ))}
-                            </select>
+                            <div className="relative">
+                              <button
+                                type="button"
+                                className="rounded-full border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600"
+                                onClick={() =>
+                                  setWeekdayPickerTodoId((prev) =>
+                                    prev === todo.id ? null : todo.id
+                                  )
+                                }
+                              >
+                                요일
+                              </button>
+                              {weekdayPickerTodoId === todo.id && (
+                                <div className="absolute right-0 z-10 mt-2 w-36 rounded-2xl border border-slate-200 bg-white p-2 shadow-lg">
+                                  <p className="px-1 pb-1 text-[11px] text-slate-500">
+                                    {todo.weekdays.length > 0
+                                      ? `선택됨: ${WEEKDAY_OPTIONS.filter((option) =>
+                                          todo.weekdays.includes(option.value)
+                                        )
+                                          .map((option) => option.label)
+                                          .join(", ")}`
+                                      : "선택된 요일 없음"}
+                                  </p>
+                                  <div className="space-y-1">
+                                    {WEEKDAY_OPTIONS.map((option) => {
+                                      const selected = todo.weekdays.includes(
+                                        option.value
+                                      );
+                                      return (
+                                        <button
+                                          key={option.value}
+                                          type="button"
+                                          className="flex w-full items-center justify-between rounded-xl px-2 py-2 text-xs text-slate-700 hover:bg-slate-50"
+                                          onClick={() =>
+                                            setWeeklyActionPlan((prev) => {
+                                              if (!prev) return prev;
+                                              const nextTodos = [...prev.todos];
+                                              const current =
+                                                nextTodos[index].weekdays;
+                                              const exists = current.includes(
+                                                option.value
+                                              );
+                                              nextTodos[index] = {
+                                                ...nextTodos[index],
+                                                weekdays: exists
+                                                  ? current.filter(
+                                                      (day) =>
+                                                        day !== option.value
+                                                    )
+                                                  : [...current, option.value],
+                                              };
+                                              return { ...prev, todos: nextTodos };
+                                            })
+                                          }
+                                        >
+                                          <span>{option.label}</span>
+                                          <span className="relative flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 bg-white transition-colors duration-200">
+                                            <span
+                                              className={`h-2.5 w-2.5 rounded-full bg-slate-900 transition-all duration-200 ease-out ${
+                                                selected
+                                                  ? "scale-100 opacity-100"
+                                                  : "scale-50 opacity-0"
+                                              }`}
+                                            />
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className="mt-2 w-full rounded-full border border-slate-200 px-2 py-1 text-[11px] text-slate-500"
+                                    onClick={() => setWeekdayPickerTodoId(null)}
+                                  >
+                                    확인
+                                  </button>
+                                </div>
+                              )}
+                            </div>
                             <button
                               type="button"
                               className="rounded-full border border-slate-200 px-3 py-2 text-[11px] text-slate-500"
@@ -3260,6 +3356,9 @@ export default function Home() {
                                   if (!prev) return prev;
                                   const nextTodos = prev.todos.filter(
                                     (_, todoIndex) => todoIndex !== index
+                                  );
+                                  setWeekdayPickerTodoId((currentId) =>
+                                    currentId === todo.id ? null : currentId
                                   );
                                   return { ...prev, todos: nextTodos };
                                 })
@@ -3281,27 +3380,28 @@ export default function Home() {
                           </div>
                         ))}
                       </div>
-                      <button
-                        type="button"
-                        className="rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600"
-                        onClick={() =>
-                          setWeeklyActionPlan((prev) =>
-                            prev
-                              ? {
-                                  ...prev,
-                                  todos: [...prev.todos, makeWeeklyActionTodo("", null)],
-                                }
-                              : {
-                                  rationale: "",
-                                  todos: [makeWeeklyActionTodo("", null)],
-                                }
-                          )
-                        }
-                      >
-                        + 투두 한 줄 추가
-                      </button>
-                    </div>
-                  )}
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      className="rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600"
+                      onClick={() =>
+                        setWeeklyActionPlan((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                todos: [...prev.todos, makeWeeklyActionTodo("", [])],
+                              }
+                            : {
+                                rationale: "직접 작성한 실행 항목입니다.",
+                                todos: [makeWeeklyActionTodo("", [])],
+                              }
+                        )
+                      }
+                    >
+                      + 투두 한 줄 추가
+                    </button>
+                  </div>
                 </div>
 
                 {goalSaveError && (

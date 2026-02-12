@@ -9,6 +9,7 @@ export async function POST(request: Request) {
       requiredState?: unknown;
       weeklyState?: unknown;
       constraints?: unknown;
+      seedTodos?: unknown;
     };
 
     const deadlineDate =
@@ -21,8 +22,14 @@ export async function POST(request: Request) {
       typeof body.weeklyState === "string" ? body.weeklyState.trim() : "";
     const constraints =
       typeof body.constraints === "string" ? body.constraints.trim() : "";
+    const seedTodos = Array.isArray(body.seedTodos)
+      ? body.seedTodos
+          .filter((todo): todo is string => typeof todo === "string")
+          .map((todo) => todo.trim())
+          .filter(Boolean)
+      : [];
 
-    if (!desiredOutcome || !weeklyState) {
+    if (!desiredOutcome || !weeklyState || seedTodos.length === 0) {
       return NextResponse.json({ result: null }, { status: 400 });
     }
 
@@ -32,6 +39,7 @@ export async function POST(request: Request) {
       requiredState,
       weeklyState,
       constraints,
+      seedTodos,
     });
     return NextResponse.json({ result });
   } catch {

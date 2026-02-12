@@ -15,6 +15,7 @@ export type YearGoal = {
     rationale: string;
     todos: Array<{
       text: string;
+      weekdays?: number[];
       weekday?: number | null;
     }>;
     achievedRate?: number;
