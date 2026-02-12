@@ -1,6 +1,7 @@
 export type YearGoal = {
   id: string;
   yearGoal: string;
+  deadlineDate?: string;
   currentPosition: {
     currentStatus: string;
     dailyAvailableTime: string;
@@ -8,6 +9,12 @@ export type YearGoal = {
     note: string;
   };
   threeMonthGoal: string;
+  weeklyActionPlan?: {
+    weekKey: string;
+    rationale: string;
+    todos: string[];
+    achievedRate?: number;
+  };
   progress: number;
   createdAt: Date;
 };
