@@ -457,6 +457,8 @@ export default function Home() {
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [newTodo, setNewTodo] = useState("");
   const [newTodoDueAt, setNewTodoDueAt] = useState("");
+  const [linkNewTodoToGoal, setLinkNewTodoToGoal] = useState(false);
+  const [newTodoGoalId, setNewTodoGoalId] = useState("");
   const [todayKey, setTodayKey] = useState(getLocalDateKey());
   const [yesterdayKey, setYesterdayKey] = useState(getYesterdayKey());
   const [currentMonth, setCurrentMonth] = useState(new Date());
@@ -482,6 +484,7 @@ export default function Home() {
   const [timerApp, setTimerApp] = useState<string | null>(null);
   const [timerFinished, setTimerFinished] = useState(false);
   const bodyOverflowRef = useRef<string | null>(null);
+  const todoInsertInFlightRef = useRef<Set<string>>(new Set());
   const timerNotifiedRef = useRef(false);
   const autoRefreshRef = useRef(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
@@ -527,7 +530,6 @@ export default function Home() {
     useState<WeeklyActionPlanResult | null>(null);
   const [weeklyActionError, setWeeklyActionError] = useState("");
   const [weeklyActionLoading, setWeeklyActionLoading] = useState(false);
-  const [weeklyAchievedRate, setWeeklyAchievedRate] = useState(0);
   const [weeklyAddedFeedback, setWeeklyAddedFeedback] = useState<
     Record<string, boolean>
   >({});
@@ -586,14 +588,18 @@ export default function Home() {
       const totalSteps = goal.weeklyActionPlan?.todos.length ?? 0;
       const doneCount = recordsByGoalId[goal.id] ?? 0;
       const progress =
-        typeof goal.weeklyActionPlan?.achievedRate === "number"
-          ? Math.max(0, Math.min(100, Math.round(goal.weeklyActionPlan.achievedRate)))
-          : totalSteps > 0
-            ? Math.min(100, Math.round((doneCount / totalSteps) * 100))
-            : 0;
+        totalSteps > 0 ? Math.min(100, Math.round((doneCount / totalSteps) * 100)) : 0;
       return { ...goal, progress };
     });
   }, [yearGoals, recordsByGoalId]);
+  const selectedGoalProgress = useMemo(() => {
+    if (!selectedGoalId) return { completed: 0, total: 0, percent: 0 };
+    const linkedTodos = todos.filter((todo) => todo.goalId === selectedGoalId);
+    const total = linkedTodos.length;
+    const completed = linkedTodos.filter((todo) => todo.done).length;
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    return { completed, total, percent };
+  }, [selectedGoalId, todos]);
   const thisMonthRecordCount = recordsThisMonth.length;
   const uiCard = "rounded-3xl bg-white p-6 shadow-sm";
   const uiPrimaryButton =
@@ -634,7 +640,6 @@ export default function Home() {
       setWeeklyStateInput("");
       setWeeklyActionPlan(null);
       setWeeklyActionError("");
-      setWeeklyAchievedRate(0);
       setWeeklyAddedFeedback({});
       setWeekdayPickerTodoId(null);
       return;
@@ -670,7 +675,6 @@ export default function Home() {
     );
     setWeeklyAddedFeedback({});
     setWeekdayPickerTodoId(null);
-    setWeeklyAchievedRate(selectedGoal.weeklyActionPlan?.achievedRate ?? 0);
     setWeeklyActionError("");
     setRecordGoalId(selectedGoal.id);
   }, [selectedGoalId, yearGoals]);
@@ -762,11 +766,12 @@ export default function Home() {
       setWeeklyActionPlan(null);
       setWeeklyActionError("");
       setWeeklyActionLoading(false);
-      setWeeklyAchievedRate(0);
       setTodoModalOpen(false);
       setTodoDraftText("");
       setTodoPolishLoading(false);
       setTodoPolishError("");
+      setLinkNewTodoToGoal(false);
+      setNewTodoGoalId("");
       setRecordsThisMonth([]);
       return;
     }
@@ -1441,18 +1446,43 @@ export default function Home() {
 
   const handleAddTodo = async () => {
     if (!user || !db || !newTodo.trim()) return;
+    if (linkNewTodoToGoal && !newTodoGoalId) return;
     const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
     const dueAtValue = newTodoDueAt ? new Date(newTodoDueAt) : null;
-    await addDoc(todosRef, {
-      text: newTodo.trim(),
-      done: false,
-      effects: [],
-      completedAt: null,
-      dueAt: dueAtValue,
-      createdAt: serverTimestamp(),
+    const normalizedText = newTodo.trim();
+    const targetGoalId = linkNewTodoToGoal ? newTodoGoalId : null;
+    const dedupKey = [
+      todayKey,
+      normalizedText,
+      targetGoalId ?? "",
+      dueAtValue ? String(dueAtValue.getTime()) : "",
+    ].join("::");
+    const existsAlready = todos.some((todo) => {
+      return (
+        todo.text.trim() === normalizedText &&
+        (todo.goalId ?? null) === targetGoalId &&
+        (toMillis(todo.dueAt) ?? null) === (dueAtValue ? dueAtValue.getTime() : null)
+      );
     });
+    if (existsAlready || todoInsertInFlightRef.current.has(dedupKey)) return;
+    todoInsertInFlightRef.current.add(dedupKey);
+    try {
+      await addDoc(todosRef, {
+        text: normalizedText,
+        done: false,
+        effects: [],
+        completedAt: null,
+        dueAt: dueAtValue,
+        goalId: targetGoalId,
+        createdAt: serverTimestamp(),
+      });
+    } finally {
+      todoInsertInFlightRef.current.delete(dedupKey);
+    }
     setNewTodo("");
     setNewTodoDueAt("");
+    setLinkNewTodoToGoal(false);
+    setNewTodoGoalId("");
   };
 
   const handleAddAiTodoAsTodo = async (
@@ -1463,15 +1493,24 @@ export default function Home() {
     if (!user || !db || !todoText.trim()) return;
     const dateKey = targetDateKey ?? todayKey;
     const todosRef = collection(db, "users", user.uid, "days", dateKey, "todos");
-    await addDoc(todosRef, {
-      text: todoText.trim(),
-      done: false,
-      effects: [],
-      completedAt: null,
-      dueAt: null,
-      goalId: goalId || null,
-      createdAt: serverTimestamp(),
-    });
+    const normalizedText = todoText.trim();
+    const targetGoalId = goalId || null;
+    const dedupKey = [dateKey, normalizedText, targetGoalId ?? "", ""].join("::");
+    if (todoInsertInFlightRef.current.has(dedupKey)) return;
+    todoInsertInFlightRef.current.add(dedupKey);
+    try {
+      await addDoc(todosRef, {
+        text: normalizedText,
+        done: false,
+        effects: [],
+        completedAt: null,
+        dueAt: null,
+        goalId: targetGoalId,
+        createdAt: serverTimestamp(),
+      });
+    } finally {
+      todoInsertInFlightRef.current.delete(dedupKey);
+    }
   };
 
   const handleToggleTodo = async (todo: TodoItem) => {
@@ -1807,7 +1846,6 @@ export default function Home() {
               text: todo.text,
               weekdays: todo.weekdays,
             })) ?? [],
-          achievedRate: weeklyAchievedRate,
         },
         updatedAt: serverTimestamp(),
       };
@@ -2007,7 +2045,6 @@ export default function Home() {
       setWeeklyStateInput("");
       setWeeklyActionPlan(null);
       setWeeklyActionError("");
-      setWeeklyAchievedRate(0);
       setWeeklyAddedFeedback({});
       setWeekdayPickerTodoId(null);
     } catch {
@@ -2022,7 +2059,6 @@ export default function Home() {
     setWeeklyActionPlan(null);
     setWeeklyActionError("");
     setWeeklyActionLoading(false);
-    setWeeklyAchievedRate(0);
     setWeeklyAddedFeedback({});
     setWeekdayPickerTodoId(null);
     setGoalSaveError("");
@@ -3195,7 +3231,6 @@ export default function Home() {
                         setWeeklyStateInput("");
                         setWeeklyActionPlan(null);
                         setWeeklyActionError("");
-                        setWeeklyAchievedRate(0);
                       }}
                     >
                       이번 주 상태 재설계
@@ -3408,34 +3443,20 @@ export default function Home() {
                   <p className="mt-3 text-xs text-rose-500">{goalSaveError}</p>
                 )}
                 <div className="mt-4 rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                  <p className="text-sm font-semibold">지난주 상태 체크</p>
+                  <p className="text-sm font-semibold">이번 주 상태 달성률</p>
                   <p className="mt-1 text-xs text-slate-500">
-                    지난주에 설정한 상태에 얼마나 가까워졌는지 체크해보세요.
+                    진행률은 감정이 아니라 행동 완료로 자동 계산됩니다.
                   </p>
-                  <div className="mt-3 flex items-center gap-3">
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={5}
-                      value={weeklyAchievedRate}
-                      onChange={(event) =>
-                        setWeeklyAchievedRate(Number(event.target.value))
-                      }
-                      className="w-full accent-slate-900"
+                  <div className="mt-3 h-2 w-full rounded-full bg-white">
+                    <div
+                      className="h-2 rounded-full bg-slate-900 transition-all duration-300"
+                      style={{ width: `${selectedGoalProgress.percent}%` }}
                     />
-                    <span className="w-12 text-right text-sm font-semibold text-slate-700">
-                      {weeklyAchievedRate}%
-                    </span>
                   </div>
-                  {selectedGoalId && (
-                    <div className="mt-3 h-2 w-full rounded-full bg-white">
-                      <div
-                        className="h-2 rounded-full bg-slate-900"
-                        style={{ width: `${weeklyAchievedRate}%` }}
-                      />
-                    </div>
-                  )}
+                  <p className="mt-3 text-sm font-semibold text-slate-700">
+                    {selectedGoalProgress.completed} / {selectedGoalProgress.total} 완료 (
+                    {selectedGoalProgress.percent}%)
+                  </p>
                 </div>
                 <button
                   type="button"
@@ -3610,9 +3631,37 @@ export default function Home() {
                 onChange={(event) => setNewTodoDueAt(event.target.value)}
                 className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
               />
+              <label className="flex items-center gap-2 text-xs text-slate-600">
+                <input
+                  type="checkbox"
+                  checked={linkNewTodoToGoal}
+                  onChange={(event) => {
+                    const checked = event.target.checked;
+                    setLinkNewTodoToGoal(checked);
+                    if (!checked) setNewTodoGoalId("");
+                  }}
+                  className="h-4 w-4"
+                />
+                이 투두를 목표에 연결하기
+              </label>
+              {linkNewTodoToGoal && (
+                <select
+                  value={newTodoGoalId}
+                  onChange={(event) => setNewTodoGoalId(event.target.value)}
+                  className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                >
+                  <option value="">목표 선택</option>
+                  {yearGoals.map((goal) => (
+                    <option key={goal.id} value={goal.id}>
+                      {goal.yearGoal || "제목 없는 목표"}
+                    </option>
+                  ))}
+                </select>
+              )}
               <button
                 className={uiPrimaryButton}
                 onClick={handleAddTodo}
+                disabled={linkNewTodoToGoal && !newTodoGoalId}
               >
                 추가
               </button>
