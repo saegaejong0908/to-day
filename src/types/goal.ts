@@ -9,10 +9,14 @@ export type YearGoal = {
     note: string;
   };
   threeMonthGoal: string;
+  weeklyState?: string;
   weeklyActionPlan?: {
     weekKey: string;
     rationale: string;
-    todos: string[];
+    todos: Array<{
+      text: string;
+      weekday?: number | null;
+    }>;
     achievedRate?: number;
   };
   progress: number;

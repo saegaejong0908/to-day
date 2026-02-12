@@ -75,9 +75,15 @@ type DayLog = {
   reviewedAt?: unknown | null;
 };
 
+type WeeklyActionTodo = {
+  id: string;
+  text: string;
+  weekday: number | null;
+};
+
 type WeeklyActionPlanResult = {
   rationale: string;
-  todos: string[];
+  todos: WeeklyActionTodo[];
 };
 
 type TodoItem = {
@@ -100,7 +106,14 @@ type CalendarEvent = {
   createdAt?: unknown;
 };
 
-type TabKey = "home" | "wake" | "shield" | "log" | "calendar" | "todos";
+type TabKey =
+  | "home"
+  | "wake"
+  | "shield"
+  | "log"
+  | "design"
+  | "calendar"
+  | "todos";
 
 type DistractionApp = {
   id: string;
@@ -504,6 +517,7 @@ export default function Home() {
   const [weakestAreaInput, setWeakestAreaInput] = useState("");
   const [positionNoteInput, setPositionNoteInput] = useState("");
   const [threeMonthGoalInput, setThreeMonthGoalInput] = useState("");
+  const [weeklyStateInput, setWeeklyStateInput] = useState("");
   const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
   const [isCreatingNewGoal, setIsCreatingNewGoal] = useState(false);
   const [showGoalPicker, setShowGoalPicker] = useState(false);
@@ -514,6 +528,9 @@ export default function Home() {
   const [weeklyActionError, setWeeklyActionError] = useState("");
   const [weeklyActionLoading, setWeeklyActionLoading] = useState(false);
   const [weeklyAchievedRate, setWeeklyAchievedRate] = useState(0);
+  const [weeklyAddedFeedback, setWeeklyAddedFeedback] = useState<
+    Record<string, boolean>
+  >({});
   const [todoModalOpen, setTodoModalOpen] = useState(false);
   const [todoDraftText, setTodoDraftText] = useState("");
   const [todoPolishLoading, setTodoPolishLoading] = useState(false);
@@ -521,7 +538,7 @@ export default function Home() {
   const [recordDraft, setRecordDraft] = useState("");
   const [recordGoalId, setRecordGoalId] = useState<string>("");
   const [recordsThisMonth, setRecordsThisMonth] = useState<RecordItem[]>([]);
-  const [logSection, setLogSection] = useState<"daily" | "goal" | "record">(
+  const [logSection, setLogSection] = useState<"daily" | "record">(
     "daily"
   );
 
@@ -583,11 +600,39 @@ export default function Home() {
   const uiDangerButton =
     "h-11 rounded-full border border-rose-200 bg-white px-4 text-xs font-semibold text-rose-500 transition-colors hover:bg-rose-50";
   const uiInputPanel = "rounded-2xl border border-slate-100 bg-slate-50 p-3";
+  const WEEKDAY_OPTIONS: Array<{ value: number; label: string }> = [
+    { value: 1, label: "월" },
+    { value: 2, label: "화" },
+    { value: 3, label: "수" },
+    { value: 4, label: "목" },
+    { value: 5, label: "금" },
+    { value: 6, label: "토" },
+    { value: 0, label: "일" },
+  ];
+  const makeWeeklyActionTodo = (
+    text = "",
+    weekday: number | null = null
+  ): WeeklyActionTodo => ({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    text,
+    weekday,
+  });
 
   useEffect(() => {
     if (yearGoals.length === 0) {
       setSelectedGoalId(null);
       setIsCreatingNewGoal(true);
+      setYearGoalInput("");
+      setDailyAvailableTimeInput("");
+      setCurrentStatusInput("");
+      setWeakestAreaInput("");
+      setPositionNoteInput("");
+      setThreeMonthGoalInput("");
+      setWeeklyStateInput("");
+      setWeeklyActionPlan(null);
+      setWeeklyActionError("");
+      setWeeklyAchievedRate(0);
+      setWeeklyAddedFeedback({});
       return;
     }
     if (isCreatingNewGoal) return;
@@ -608,14 +653,18 @@ export default function Home() {
       selectedGoal.currentPosition.note || selectedGoal.currentPosition.weakestArea
     );
     setThreeMonthGoalInput(selectedGoal.threeMonthGoal);
+    setWeeklyStateInput(selectedGoal.weeklyState ?? selectedGoal.threeMonthGoal);
     setWeeklyActionPlan(
       selectedGoal.weeklyActionPlan && selectedGoal.weeklyActionPlan.todos.length > 0
         ? {
             rationale: selectedGoal.weeklyActionPlan.rationale,
-            todos: selectedGoal.weeklyActionPlan.todos,
+            todos: selectedGoal.weeklyActionPlan.todos.map((todo) =>
+              makeWeeklyActionTodo(todo.text, todo.weekday ?? null)
+            ),
           }
         : null
     );
+    setWeeklyAddedFeedback({});
     setWeeklyAchievedRate(selectedGoal.weeklyActionPlan?.achievedRate ?? 0);
     setWeeklyActionError("");
     setRecordGoalId(selectedGoal.id);
@@ -701,6 +750,7 @@ export default function Home() {
       setWeakestAreaInput("");
       setPositionNoteInput("");
       setThreeMonthGoalInput("");
+      setWeeklyStateInput("");
       setSelectedGoalId(null);
       setGoalSaving(false);
       setGoalSaveError("");
@@ -921,9 +971,28 @@ export default function Home() {
             : Array.isArray(legacyRoadmap?.monthlyPlan)
               ? legacyRoadmap?.monthlyPlan.join("\n")
               : "";
+        const weeklyState =
+          typeof (data as { weeklyState?: unknown }).weeklyState === "string"
+            ? ((data as { weeklyState?: string }).weeklyState ?? "")
+            : threeMonthGoal;
         const weeklyActionPlanRaw = (data.weeklyActionPlan ?? {}) as Partial<
           NonNullable<YearGoal["weeklyActionPlan"]>
         >;
+        const normalizedWeeklyTodos = Array.isArray(weeklyActionPlanRaw.todos)
+          ? weeklyActionPlanRaw.todos
+              .map((todo) => {
+                if (typeof todo === "string") {
+                  return makeWeeklyActionTodo(todo, null);
+                }
+                if (typeof todo?.text !== "string") return null;
+                return makeWeeklyActionTodo(
+                  todo.text.trim(),
+                  typeof todo.weekday === "number" ? todo.weekday : null
+                );
+              })
+              .filter((todo): todo is WeeklyActionTodo => Boolean(todo))
+              .filter((todo) => Boolean(todo.text))
+          : [];
         const currentPositionRaw = (data.currentPosition ?? {}) as Partial<
           YearGoal["currentPosition"]
         >;
@@ -948,6 +1017,7 @@ export default function Home() {
           deadlineDate:
             typeof data.deadlineDate === "string" ? data.deadlineDate : "",
           threeMonthGoal,
+          weeklyState,
           weeklyActionPlan: {
             weekKey:
               typeof weeklyActionPlanRaw.weekKey === "string"
@@ -957,11 +1027,7 @@ export default function Home() {
               typeof weeklyActionPlanRaw.rationale === "string"
                 ? weeklyActionPlanRaw.rationale
                 : "",
-            todos: Array.isArray(weeklyActionPlanRaw.todos)
-              ? weeklyActionPlanRaw.todos.filter(
-                  (todo): todo is string => typeof todo === "string"
-                )
-              : [],
+            todos: normalizedWeeklyTodos,
             achievedRate:
               typeof weeklyActionPlanRaw.achievedRate === "number"
                 ? weeklyActionPlanRaw.achievedRate
@@ -1377,9 +1443,14 @@ export default function Home() {
     setNewTodoDueAt("");
   };
 
-  const handleAddAiTodoAsTodo = async (todoText: string, goalId?: string) => {
+  const handleAddAiTodoAsTodo = async (
+    todoText: string,
+    goalId?: string,
+    targetDateKey?: string
+  ) => {
     if (!user || !db || !todoText.trim()) return;
-    const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
+    const dateKey = targetDateKey ?? todayKey;
+    const todosRef = collection(db, "users", user.uid, "days", dateKey, "todos");
     await addDoc(todosRef, {
       text: todoText.trim(),
       done: false,
@@ -1695,7 +1766,8 @@ export default function Home() {
   const handleSaveGoalFields = async () => {
     if (!user || !db) return;
     const desiredOutcome = yearGoalInput.trim();
-    const weeklyState = threeMonthGoalInput.trim();
+    const middleGoalState = threeMonthGoalInput.trim();
+    const weeklyState = weeklyStateInput.trim();
     if (!desiredOutcome) {
       setGoalSaveError("원하는 결과를 먼저 입력해 주세요.");
       return;
@@ -1713,7 +1785,8 @@ export default function Home() {
           weakestArea: weakestAreaInput.trim(),
           note: positionNoteInput.trim(),
         },
-        threeMonthGoal: weeklyState,
+        threeMonthGoal: middleGoalState,
+        weeklyState,
         weeklyActionPlan: {
           weekKey: todayKey,
           rationale: weeklyActionPlan?.rationale ?? "",
@@ -1747,7 +1820,7 @@ export default function Home() {
 
   const handleGenerateWeeklyActionPlan = async () => {
     const desiredOutcome = yearGoalInput.trim();
-    const weeklyState = threeMonthGoalInput.trim();
+    const weeklyState = weeklyStateInput.trim();
     if (!desiredOutcome || !weeklyState) {
       setWeeklyActionError("원하는 결과와 1주 뒤 상태를 먼저 작성해 주세요.");
       return;
@@ -1772,7 +1845,7 @@ export default function Home() {
         return;
       }
       const data = (await response.json()) as {
-        result?: WeeklyActionPlanResult | null;
+        result?: { rationale: string; todos: string[] } | null;
       };
       if (!data.result) {
         setWeeklyActionError("실행 분해 결과가 비어 있어요.");
@@ -1780,13 +1853,43 @@ export default function Home() {
       }
       setWeeklyActionPlan({
         rationale: data.result.rationale,
-        todos: data.result.todos.slice(0, 7),
+        todos: data.result.todos
+          .slice(0, 7)
+          .map((todo) => makeWeeklyActionTodo(todo, null)),
       });
+      setWeeklyAddedFeedback({});
     } catch {
       setWeeklyActionError("실행 분해 중 오류가 발생했어요.");
     } finally {
       setWeeklyActionLoading(false);
     }
+  };
+
+  const getNextDateKeyByWeekday = (weekday: number): string => {
+    const now = new Date();
+    const todayWeekday = now.getDay();
+    let diff = (weekday - todayWeekday + 7) % 7;
+    if (diff === 0) diff = 7;
+    const nextDate = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + diff
+    );
+    return getLocalDateKey(nextDate);
+  };
+
+  const handleAddWeeklyPlannedTodo = async (todo: WeeklyActionTodo) => {
+    if (!todo.text.trim()) return;
+    if (todo.weekday === null) {
+      setWeeklyActionError("요일을 먼저 선택해 주세요.");
+      return;
+    }
+    const targetDateKey = getNextDateKeyByWeekday(todo.weekday);
+    await handleAddAiTodoAsTodo(todo.text, selectedGoalId ?? undefined, targetDateKey);
+    setWeeklyAddedFeedback((prev) => ({ ...prev, [todo.id]: true }));
+    window.setTimeout(() => {
+      setWeeklyAddedFeedback((prev) => ({ ...prev, [todo.id]: false }));
+    }, 1200);
   };
 
   const handlePolishTodoDraft = async () => {
@@ -1858,9 +1961,20 @@ export default function Home() {
       const goalRef = doc(db, "users", user.uid, "yearGoals", selectedGoalId);
       await deleteDoc(goalRef);
       setRecordGoalId((prev) => (prev === selectedGoalId ? "" : prev));
+      setIsCreatingNewGoal(true);
+      setShowGoalPicker(false);
       setSelectedGoalId(null);
+      setYearGoalInput("");
+      setDailyAvailableTimeInput("");
+      setCurrentStatusInput("");
+      setWeakestAreaInput("");
+      setPositionNoteInput("");
+      setThreeMonthGoalInput("");
+      setWeeklyStateInput("");
       setWeeklyActionPlan(null);
+      setWeeklyActionError("");
       setWeeklyAchievedRate(0);
+      setWeeklyAddedFeedback({});
     } catch {
       // ignore goal delete failures
     }
@@ -1874,6 +1988,7 @@ export default function Home() {
     setWeeklyActionError("");
     setWeeklyActionLoading(false);
     setWeeklyAchievedRate(0);
+    setWeeklyAddedFeedback({});
     setGoalSaveError("");
     setYearGoalInput("");
     setCurrentStatusInput("");
@@ -1881,6 +1996,7 @@ export default function Home() {
     setWeakestAreaInput("");
     setPositionNoteInput("");
     setThreeMonthGoalInput("");
+    setWeeklyStateInput("");
     setRecordGoalId("");
   };
 
@@ -2456,10 +2572,7 @@ export default function Home() {
                       <button
                         type="button"
                         className="mt-2 h-10 w-full rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-600"
-                        onClick={() => {
-                          setActiveTab("log");
-                          setLogSection("goal");
-                        }}
+                        onClick={() => setActiveTab("design")}
                       >
                         정체기 극복하기 →
                       </button>
@@ -2823,10 +2936,11 @@ export default function Home() {
           </>
         )}
 
-        {activeTab === "log" && (
+        {(activeTab === "log" || activeTab === "design") && (
           <>
-            <section className={uiCard}>
-              <div className="grid grid-cols-3 gap-2 text-xs">
+            {activeTab === "log" && (
+              <section className={uiCard}>
+                <div className="grid grid-cols-2 gap-2 text-xs">
                 <button
                   type="button"
                   onClick={() => setLogSection("daily")}
@@ -2840,17 +2954,6 @@ export default function Home() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setLogSection("goal")}
-                  className={`h-10 rounded-full border px-2 text-center font-semibold ${
-                    logSection === "goal"
-                      ? "border-slate-900 bg-slate-900 text-white"
-                      : "border-slate-200 text-slate-600"
-                  }`}
-                >
-                  목표 설계
-                </button>
-                <button
-                  type="button"
                   onClick={() => setLogSection("record")}
                   className={`h-10 rounded-full border px-2 text-center font-semibold ${
                     logSection === "record"
@@ -2860,10 +2963,11 @@ export default function Home() {
                 >
                   실행 기록
                 </button>
-              </div>
-            </section>
+                </div>
+              </section>
+            )}
 
-            {logSection === "daily" && (
+            {activeTab === "log" && logSection === "daily" && (
               <section className={uiCard}>
                 <p className="text-sm font-semibold">오늘 기록</p>
                 <p className="text-xs text-slate-400">
@@ -2910,7 +3014,7 @@ export default function Home() {
               </section>
             )}
 
-            {logSection === "goal" && (
+            {activeTab === "design" && (
               <section className={uiCard}>
                 <p className="text-lg font-semibold">설계</p>
                 <p className="mt-1 text-sm text-slate-500">결과 → 상태 → 행동</p>
@@ -2969,15 +3073,6 @@ export default function Home() {
                   <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
                     <p className="text-sm font-semibold">도착점 설정</p>
                     <label className="mt-3 block">
-                      <span className="text-xs text-slate-500">데드라인 날짜</span>
-                      <input
-                        type="date"
-                        value={dailyAvailableTimeInput}
-                        onChange={(event) => setDailyAvailableTimeInput(event.target.value)}
-                        className="mt-1 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-                      />
-                    </label>
-                    <label className="mt-3 block">
                       <span className="text-xs text-slate-500">원하는 결과</span>
                       <textarea
                         value={yearGoalInput}
@@ -3019,28 +3114,55 @@ export default function Home() {
                   </div>
 
                   <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
+                    <p className="text-sm font-semibold">중간 목표 설정</p>
+                    <label className="mt-3 block">
+                      <span className="text-xs text-slate-500">중간 목표 데드라인</span>
+                      <input
+                        type="date"
+                        value={dailyAvailableTimeInput}
+                        onChange={(event) =>
+                          setDailyAvailableTimeInput(event.target.value)
+                        }
+                        className="mt-1 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                      />
+                    </label>
+                    <label className="mt-3 block">
+                      <span className="text-xs text-slate-500">중간 목표 상태</span>
+                      <textarea
+                        value={threeMonthGoalInput}
+                        onChange={(event) =>
+                          setThreeMonthGoalInput(event.target.value)
+                        }
+                        rows={3}
+                        className="mt-1 w-full rounded-2xl border border-slate-200 p-3 text-sm"
+                        placeholder="데드라인 시점에 도달해 있어야 할 중간 상태를 적어보세요."
+                      />
+                    </label>
+                  </div>
+
+                  <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
                     <p className="text-sm font-semibold">1주 뒤 나는 어떤 상태인가?</p>
                     <p className="mt-1 text-xs text-slate-500">
-                      이번 주가 끝났을 때, 나는 어떤 상태에 가까워져 있으면 좋겠나요?
+                      중간 목표와 구분해서, 이번 주 끝에서의 상태만 적어보세요.
                     </p>
                     <textarea
-                      value={threeMonthGoalInput}
-                      onChange={(event) => setThreeMonthGoalInput(event.target.value)}
+                      value={weeklyStateInput}
+                      onChange={(event) => setWeeklyStateInput(event.target.value)}
                       rows={4}
                       className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                      placeholder="예) 국어 모의고사 5회 풀이 완료, 운동 3회 완료, 기출 분석 2년치 완료"
+                      placeholder="예) 이번 주에 완료될 상태를 구체적으로 적어보세요."
                     />
                     <button
                       type="button"
                       className="mt-3 text-xs font-semibold text-slate-600 hover:text-slate-900"
                       onClick={() => {
-                        setThreeMonthGoalInput("");
+                        setWeeklyStateInput("");
                         setWeeklyActionPlan(null);
                         setWeeklyActionError("");
                         setWeeklyAchievedRate(0);
                       }}
                     >
-                      다음 주 상태 재설계
+                      이번 주 상태 재설계
                     </button>
                   </div>
                 </div>
@@ -3071,9 +3193,12 @@ export default function Home() {
                       onClick={handleGenerateWeeklyActionPlan}
                       disabled={weeklyActionLoading}
                     >
-                      {weeklyActionLoading ? "생성 중..." : "AI 실행 투두 생성"}
+                      {weeklyActionLoading ? "분해 중..." : "AI 분해 도움 받기"}
                     </button>
                   </div>
+                  <p className="mt-1 text-xs text-slate-500">
+                    직접 실행 항목을 적고, 필요할 때만 AI로 분해 도움을 받으세요.
+                  </p>
 
                   {weeklyActionError && (
                     <p className="mt-2 text-xs text-rose-500">{weeklyActionError}</p>
@@ -3086,19 +3211,47 @@ export default function Home() {
                       </p>
                       <div className="space-y-2">
                         {weeklyActionPlan.todos.map((todo, index) => (
-                          <div key={`${index}-${todo}`} className="flex items-center gap-2">
+                          <div key={todo.id} className="flex items-center gap-2">
                             <input
-                              value={todo}
+                              value={todo.text}
                               onChange={(event) =>
                                 setWeeklyActionPlan((prev) => {
                                   if (!prev) return prev;
                                   const nextTodos = [...prev.todos];
-                                  nextTodos[index] = event.target.value;
+                                  nextTodos[index] = {
+                                    ...nextTodos[index],
+                                    text: event.target.value,
+                                  };
                                   return { ...prev, todos: nextTodos };
                                 })
                               }
                               className="flex-1 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs"
                             />
+                            <select
+                              value={todo.weekday ?? ""}
+                              onChange={(event) =>
+                                setWeeklyActionPlan((prev) => {
+                                  if (!prev) return prev;
+                                  const nextTodos = [...prev.todos];
+                                  nextTodos[index] = {
+                                    ...nextTodos[index],
+                                    weekday:
+                                      event.target.value === ""
+                                        ? null
+                                        : Number(event.target.value),
+                                  };
+                                  return { ...prev, todos: nextTodos };
+                                })
+                              }
+                              className="rounded-full border border-slate-200 bg-white px-2 py-2 text-[11px] text-slate-600"
+                            >
+                              <option value="">요일</option>
+                              {WEEKDAY_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
                             <button
                               type="button"
                               className="rounded-full border border-slate-200 px-3 py-2 text-[11px] text-slate-500"
@@ -3116,10 +3269,14 @@ export default function Home() {
                             </button>
                             <button
                               type="button"
-                              className="rounded-full bg-slate-900 px-3 py-2 text-[11px] font-semibold text-white"
-                              onClick={() => handleAddAiTodoAsTodo(todo, selectedGoalId ?? undefined)}
+                              className={`rounded-full px-3 py-2 text-[11px] font-semibold text-white transition ${
+                                weeklyAddedFeedback[todo.id]
+                                  ? "bg-emerald-600"
+                                  : "bg-slate-900"
+                              }`}
+                              onClick={() => handleAddWeeklyPlannedTodo(todo)}
                             >
-                              투두 추가
+                              {weeklyAddedFeedback[todo.id] ? "추가됨 ✓" : "투두 추가"}
                             </button>
                           </div>
                         ))}
@@ -3130,8 +3287,14 @@ export default function Home() {
                         onClick={() =>
                           setWeeklyActionPlan((prev) =>
                             prev
-                              ? { ...prev, todos: [...prev.todos, ""] }
-                              : { rationale: "", todos: [""] }
+                              ? {
+                                  ...prev,
+                                  todos: [...prev.todos, makeWeeklyActionTodo("", null)],
+                                }
+                              : {
+                                  rationale: "",
+                                  todos: [makeWeeklyActionTodo("", null)],
+                                }
                           )
                         }
                       >
@@ -3187,7 +3350,7 @@ export default function Home() {
               </section>
             )}
 
-            {logSection === "record" && (
+            {activeTab === "log" && logSection === "record" && (
               <section className={uiCard}>
                 <p className="text-sm font-semibold">목표 연결 기록</p>
                 <p className="text-xs text-slate-400">
@@ -3561,7 +3724,7 @@ export default function Home() {
 
       <nav className="fixed bottom-0 left-0 right-0 z-40 border-t border-slate-200 bg-white">
         <div
-          className="mx-auto grid w-full max-w-md grid-cols-6 gap-2 px-4 py-3 text-xs text-slate-500"
+          className="mx-auto grid w-full max-w-md grid-cols-7 gap-2 px-4 py-3 text-xs text-slate-500"
           style={{ paddingBottom: "calc(0.75rem + env(safe-area-inset-bottom))" }}
         >
           {[
@@ -3569,6 +3732,7 @@ export default function Home() {
             { key: "wake", label: "기상" },
             { key: "shield", label: "보호" },
             { key: "log", label: "기록" },
+            { key: "design", label: "설계" },
             { key: "calendar", label: "달력" },
             { key: "todos", label: "투두" },
           ].map((tab) => (
