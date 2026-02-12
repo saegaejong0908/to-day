@@ -14,6 +14,8 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDocs,
+  limit,
   onSnapshot,
   orderBy,
   query,
@@ -1451,22 +1453,15 @@ export default function Home() {
     const dueAtValue = newTodoDueAt ? new Date(newTodoDueAt) : null;
     const normalizedText = newTodo.trim();
     const targetGoalId = linkNewTodoToGoal ? newTodoGoalId : null;
-    const dedupKey = [
-      todayKey,
-      normalizedText,
-      targetGoalId ?? "",
-      dueAtValue ? String(dueAtValue.getTime()) : "",
-    ].join("::");
-    const existsAlready = todos.some((todo) => {
-      return (
-        todo.text.trim() === normalizedText &&
-        (todo.goalId ?? null) === targetGoalId &&
-        (toMillis(todo.dueAt) ?? null) === (dueAtValue ? dueAtValue.getTime() : null)
-      );
-    });
+    const dedupKey = [todayKey, normalizedText].join("::");
+    const existsAlready = todos.some((todo) => todo.text.trim() === normalizedText);
     if (existsAlready || todoInsertInFlightRef.current.has(dedupKey)) return;
     todoInsertInFlightRef.current.add(dedupKey);
     try {
+      const duplicateSnapshot = await getDocs(
+        query(todosRef, where("text", "==", normalizedText), limit(1))
+      );
+      if (!duplicateSnapshot.empty) return;
       await addDoc(todosRef, {
         text: normalizedText,
         done: false,
@@ -1495,10 +1490,17 @@ export default function Home() {
     const todosRef = collection(db, "users", user.uid, "days", dateKey, "todos");
     const normalizedText = todoText.trim();
     const targetGoalId = goalId || null;
-    const dedupKey = [dateKey, normalizedText, targetGoalId ?? "", ""].join("::");
+    const dedupKey = [dateKey, normalizedText].join("::");
     if (todoInsertInFlightRef.current.has(dedupKey)) return;
     todoInsertInFlightRef.current.add(dedupKey);
     try {
+      if (dateKey === todayKey && todos.some((todo) => todo.text.trim() === normalizedText)) {
+        return;
+      }
+      const duplicateSnapshot = await getDocs(
+        query(todosRef, where("text", "==", normalizedText), limit(1))
+      );
+      if (!duplicateSnapshot.empty) return;
       await addDoc(todosRef, {
         text: normalizedText,
         done: false,
@@ -1516,8 +1518,20 @@ export default function Home() {
   const handleToggleTodo = async (todo: TodoItem) => {
     if (!user || !db) return;
     if (!todo.done) {
-      setEffectSelections(() => ({} as Record<EffectType, Effect["intensity"]>));
-      setEffectModalTodo(todo);
+      const todoRef = doc(
+        db,
+        "users",
+        user.uid,
+        "days",
+        todayKey,
+        "todos",
+        todo.id
+      );
+      await updateDoc(todoRef, {
+        done: true,
+        completedAt: serverTimestamp(),
+        effects: [],
+      });
       return;
     }
     const todoRef = doc(
@@ -3615,9 +3629,6 @@ export default function Home() {
             <p className="text-xs text-slate-400">
               복습을 끝냈으니 오늘의 할 일을 정리해요.
             </p>
-            <p className="mt-1 text-xs text-slate-400">
-              오늘 기록된 Effect {todayEffectCount}개
-            </p>
             <div className={`mt-4 ${uiInputPanel} flex flex-col gap-2`}>
               <input
                 value={newTodo}
@@ -4092,7 +4103,7 @@ export default function Home() {
         </div>
       )}
 
-      {effectModalTodo && (
+      {false && effectModalTodo && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 px-6">
           <div className="w-full max-w-sm rounded-3xl bg-white p-6 max-h-[80vh] overflow-y-auto">
             <div className="flex items-start justify-between gap-4">
