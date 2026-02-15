@@ -4121,7 +4121,7 @@ export default function Home() {
               </button>
             </div>
             <p className="mt-2 text-sm text-slate-500">
-              대상: {effectModalTodo.text}
+              대상: {effectModalTodo?.text}
             </p>
             <p className="mt-2 text-xs text-slate-400">
               최대 2개까지 선택할 수 있어요.
