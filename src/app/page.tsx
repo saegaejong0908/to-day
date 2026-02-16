@@ -55,6 +55,10 @@ import type { DesignPlan } from "@/types/designPlan";
 import type { GoalTrack } from "@/types/goalTrack";
 import type { GoalTrackEvent } from "@/types/goalTrackEvent";
 import { buildEventId } from "@/domain/execution";
+import {
+  deleteGoalTrackEventsByGoalTrackId,
+  deleteGoalTrackEventsByTodoId,
+} from "@/lib/goalTrackEvents";
 import { ExecutionEvidenceCard } from "@/components/design/ExecutionEvidenceCard";
 
 const USER_TYPES = ["neutral"] as const;
@@ -664,6 +668,7 @@ export default function Home() {
   const [goalTrackTodoText, setGoalTrackTodoText] = useState("");
   const [goalTrackTodoDueAt, setGoalTrackTodoDueAt] = useState("");
   const [goalTrackEvents, setGoalTrackEvents] = useState<GoalTrackEvent[]>([]);
+  const [executionToast, setExecutionToast] = useState<string | null>(null);
   const [todayKey, setTodayKey] = useState(getLocalDateKey());
   const [yesterdayKey, setYesterdayKey] = useState(getYesterdayKey());
   const [currentMonth, setCurrentMonth] = useState(new Date());
@@ -692,6 +697,7 @@ export default function Home() {
   const [timerFinished, setTimerFinished] = useState(false);
   const bodyOverflowRef = useRef<string | null>(null);
   const todoInsertInFlightRef = useRef<Set<string>>(new Set());
+  const goalTrackEventsBackfillRunRef = useRef(false);
   const timerNotifiedRef = useRef(false);
   const autoRefreshRef = useRef(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
@@ -927,6 +933,7 @@ export default function Home() {
       setGoalTrackTodoText("");
       setGoalTrackTodoDueAt("");
       setGoalTrackEvents([]);
+      goalTrackEventsBackfillRunRef.current = false;
       setRecordsThisMonth([]);
       return;
     }
@@ -1194,6 +1201,34 @@ export default function Home() {
       unsubscribeRecords();
     };
   }, [user, todayKey, yesterdayKey]);
+
+  useEffect(() => {
+    if (!user || !db || goalTrackEventsBackfillRunRef.current) return;
+    const completedLinked = todos.filter(
+      (t) => t.done && t.goalTrackId && t.text.trim()
+    );
+    if (completedLinked.length === 0) return;
+    const eventIds = new Set(goalTrackEvents.map((e) => e.id));
+    const toUpsert = completedLinked.filter((t) => {
+      const eid = buildEventId(t.goalTrackId!, t.id, todayKey);
+      return !eventIds.has(eid);
+    });
+    if (toUpsert.length === 0) return;
+    goalTrackEventsBackfillRunRef.current = true;
+    const eventsRef = collection(db, "users", user.uid, "goalTrackEvents");
+    void Promise.all(
+      toUpsert.map((t) => {
+        const eid = buildEventId(t.goalTrackId!, t.id, todayKey);
+        return setDoc(doc(eventsRef, eid), {
+          goalTrackId: t.goalTrackId,
+          todoId: t.id,
+          todoText: t.text,
+          dateKey: todayKey,
+          createdAt: serverTimestamp(),
+        });
+      })
+    );
+  }, [user, db, todos, goalTrackEvents, todayKey]);
 
   useEffect(() => {
     if (!user || !db) {
@@ -1660,6 +1695,7 @@ export default function Home() {
     const tracksToDelete = goalTracks.filter((t) => t.designPlanId === id);
     for (const track of tracksToDelete) {
       await nullifyGoalTrackIdInAllTodos(track.id);
+      await deleteGoalTrackEventsByGoalTrackId(db, user.uid, track.id);
     }
     let batch = writeBatch(db);
     for (const track of tracksToDelete) {
@@ -1710,6 +1746,7 @@ export default function Home() {
   const handleDeleteGoalTrack = async (id: string) => {
     if (!user || !db) return;
     await nullifyGoalTrackIdInAllTodos(id);
+    await deleteGoalTrackEventsByGoalTrackId(db, user.uid, id);
     const trackRef = doc(db, "users", user.uid, "goalTracks", id);
     await deleteDoc(trackRef);
   };
@@ -1779,6 +1816,10 @@ export default function Home() {
           dateKey: todayKey,
           createdAt: serverTimestamp(),
         });
+        const track = goalTracks.find((t) => t.id === goalTrackId);
+        const trackName = track?.title || "목표";
+        setExecutionToast(`${trackName} 실행 1회 기록`);
+        window.setTimeout(() => setExecutionToast(null), 2000);
       }
       return;
     }
@@ -1851,6 +1892,9 @@ export default function Home() {
 
   const handleDeleteTodo = async (todo: TodoItem) => {
     if (!user || !db) return;
+    if (todo.goalTrackId) {
+      await deleteGoalTrackEventsByTodoId(db, user.uid, todo.id);
+    }
     const todoRef = doc(
       db,
       "users",
@@ -4364,6 +4408,12 @@ export default function Home() {
               </>
             )}
           </div>
+        </div>
+      )}
+
+      {executionToast && (
+        <div className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-full bg-slate-800 px-4 py-2 text-xs text-white shadow-lg">
+          {executionToast}
         </div>
       )}
     </div>
