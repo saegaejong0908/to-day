@@ -54,6 +54,27 @@ export const calcLast7Days = (
   return map;
 };
 
+/** 최근 7일 중 실행한 날 수 (counts 기반) */
+export const getExecutedDayCount = (
+  counts: Record<string, number>,
+  keys: string[]
+): number => keys.filter((k) => (counts[k] ?? 0) > 0).length;
+
+/** 최근 7일 총 행동 수 */
+export const getTotalActionCount = (
+  counts: Record<string, number>,
+  keys: string[]
+): number => keys.reduce((sum, k) => sum + (counts[k] ?? 0), 0);
+
+/** 최근 미실행 일수 (0=오늘 실행, 1=어제 실행, ... 7=7일간 미실행) */
+export const getRecentGap = (
+  counts: Record<string, number>,
+  keys: string[]
+): number => {
+  const idx = keys.findIndex((k) => (counts[k] ?? 0) > 0);
+  return idx === -1 ? 7 : idx;
+};
+
 /** 최근 실행 5개 (최신순) */
 export const recentEvents = (
   events: GoalTrackEvent[],

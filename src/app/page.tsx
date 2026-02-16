@@ -54,12 +54,19 @@ import type { RecordItem } from "@/types/record";
 import type { DesignPlan } from "@/types/designPlan";
 import type { GoalTrack } from "@/types/goalTrack";
 import type { GoalTrackEvent } from "@/types/goalTrackEvent";
-import { buildEventId } from "@/domain/execution";
+import type { GoalTrackWeeklyReview } from "@/types/goalTrackWeeklyReview";
+import { buildEventId, calcLast7Days } from "@/domain/execution";
+import { buildReviewId } from "@/domain/weeklyReview";
+import { generateCoachResponse } from "@/domain/weeklyReview";
+import { getWeekStartKeyKST } from "@/domain/date";
+import { getWeekStartKeysForLastNWeeks } from "@/domain/date";
 import {
   deleteGoalTrackEventsByGoalTrackId,
   deleteGoalTrackEventsByTodoId,
 } from "@/lib/goalTrackEvents";
 import { ExecutionEvidenceCard } from "@/components/design/ExecutionEvidenceCard";
+import { WeeklyReviewCard } from "@/components/design/WeeklyReviewCard";
+import { InlineGoalLinkEditor } from "@/components/todo/InlineGoalLinkEditor";
 
 const USER_TYPES = ["neutral"] as const;
 type UserType = (typeof USER_TYPES)[number];
@@ -668,7 +675,12 @@ export default function Home() {
   const [goalTrackTodoText, setGoalTrackTodoText] = useState("");
   const [goalTrackTodoDueAt, setGoalTrackTodoDueAt] = useState("");
   const [goalTrackEvents, setGoalTrackEvents] = useState<GoalTrackEvent[]>([]);
+  const [goalTrackWeeklyReviews, setGoalTrackWeeklyReviews] = useState<
+    GoalTrackWeeklyReview[]
+  >([]);
+  const [weeklyReviewSaving, setWeeklyReviewSaving] = useState(false);
   const [executionToast, setExecutionToast] = useState<string | null>(null);
+  const [editingGoalLinkTodoId, setEditingGoalLinkTodoId] = useState<string | null>(null);
   const [todayKey, setTodayKey] = useState(getLocalDateKey());
   const [yesterdayKey, setYesterdayKey] = useState(getYesterdayKey());
   const [currentMonth, setCurrentMonth] = useState(new Date());
@@ -933,7 +945,9 @@ export default function Home() {
       setGoalTrackTodoText("");
       setGoalTrackTodoDueAt("");
       setGoalTrackEvents([]);
+      setGoalTrackWeeklyReviews([]);
       goalTrackEventsBackfillRunRef.current = false;
+      setEditingGoalLinkTodoId(null);
       setRecordsThisMonth([]);
       return;
     }
@@ -1156,6 +1170,48 @@ export default function Home() {
       setGoalTrackEvents(next);
     });
 
+    const last8WeekKeys = getWeekStartKeysForLastNWeeks(8);
+    const weeklyReviewsRef = collection(
+      db,
+      "users",
+      user.uid,
+      "goalTrackWeeklyReviews"
+    );
+    const weeklyReviewsQuery = query(
+      weeklyReviewsRef,
+      where("weekStartKey", "in", last8WeekKeys)
+    );
+    const unsubscribeWeeklyReviews = onSnapshot(weeklyReviewsQuery, (snapshot) => {
+      const next: GoalTrackWeeklyReview[] = snapshot.docs.map((item) => {
+        const data = item.data();
+        const toDate = (v: unknown): Date => {
+          if (typeof (v as { toDate?: () => Date })?.toDate === "function") {
+            return (v as { toDate: () => Date }).toDate();
+          }
+          return v instanceof Date ? v : new Date();
+        };
+        return {
+          id: item.id,
+          goalTrackId: typeof data.goalTrackId === "string" ? data.goalTrackId : "",
+          weekStartKey: typeof data.weekStartKey === "string" ? data.weekStartKey : "",
+          rhythm:
+            data.rhythm === "steady" || data.rhythm === "sporadic" || data.rhythm === "stopped"
+              ? data.rhythm
+              : "steady",
+          wobbleMoment: typeof data.wobbleMoment === "string" ? data.wobbleMoment : "",
+          nextWeekOneChange:
+            typeof data.nextWeekOneChange === "string" ? data.nextWeekOneChange : "",
+          nextWeekKeepOne:
+            typeof data.nextWeekKeepOne === "string" ? data.nextWeekKeepOne : undefined,
+          coachSummary: typeof data.coachSummary === "string" ? data.coachSummary : "",
+          coachQuestion: typeof data.coachQuestion === "string" ? data.coachQuestion : "",
+          createdAt: toDate(data.createdAt),
+          updatedAt: toDate(data.updatedAt),
+        };
+      });
+      setGoalTrackWeeklyReviews(next);
+    });
+
     const recordsRef = collection(db, "users", user.uid, "records");
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -1198,6 +1254,7 @@ export default function Home() {
       unsubscribeDesignPlans();
       unsubscribeGoalTracks();
       unsubscribeGoalTrackEvents();
+      unsubscribeWeeklyReviews();
       unsubscribeRecords();
     };
   }, [user, todayKey, yesterdayKey]);
@@ -1905,6 +1962,71 @@ export default function Home() {
       todo.id
     );
     await deleteDoc(todoRef);
+  };
+
+  const handleUpdateTodoGoalTrackId = async (
+    todo: TodoItem,
+    goalTrackId: string | null
+  ) => {
+    if (!user || !db) return;
+    const todoRef = doc(
+      db,
+      "users",
+      user.uid,
+      "days",
+      todayKey,
+      "todos",
+      todo.id
+    );
+    await updateDoc(todoRef, { goalTrackId });
+    setEditingGoalLinkTodoId(null);
+  };
+
+  const handleSaveWeeklyReview = async (data: {
+    goalTrackId: string;
+    weekStartKey: string;
+    rhythm: "steady" | "sporadic" | "stopped";
+    wobbleMoment: string;
+    nextWeekOneChange: string;
+    nextWeekKeepOne?: string;
+  }) => {
+    if (!user || !db) return;
+    setWeeklyReviewSaving(true);
+    try {
+      const { coachSummary, coachQuestion } = generateCoachResponse({
+        rhythm: data.rhythm,
+        wobbleMoment: data.wobbleMoment,
+        nextWeekOneChange: data.nextWeekOneChange,
+        nextWeekKeepOne: data.nextWeekKeepOne,
+      });
+      const reviewId = buildReviewId(data.goalTrackId, data.weekStartKey);
+      const reviewRef = doc(
+        db,
+        "users",
+        user.uid,
+        "goalTrackWeeklyReviews",
+        reviewId
+      );
+      const existing = goalTrackWeeklyReviews.some((r) => r.id === reviewId);
+      await setDoc(
+        reviewRef,
+        {
+          goalTrackId: data.goalTrackId,
+          weekStartKey: data.weekStartKey,
+          rhythm: data.rhythm,
+          wobbleMoment: data.wobbleMoment,
+          nextWeekOneChange: data.nextWeekOneChange,
+          nextWeekKeepOne: data.nextWeekKeepOne ?? null,
+          coachSummary,
+          coachQuestion,
+          updatedAt: serverTimestamp(),
+          ...(existing ? {} : { createdAt: serverTimestamp() }),
+        },
+        { merge: true }
+      );
+    } finally {
+      setWeeklyReviewSaving(false);
+    }
   };
 
   const handleUpdateMissedReason = async (
@@ -3613,6 +3735,20 @@ export default function Home() {
                                   </button>
                                 )}
                                 <ExecutionEvidenceCard track={track} events={goalTrackEvents} />
+                                <WeeklyReviewCard
+                                  track={track}
+                                  review={
+                                    goalTrackWeeklyReviews.find(
+                                      (r) =>
+                                        r.goalTrackId === track.id &&
+                                        r.weekStartKey === getWeekStartKeyKST()
+                                    ) ?? null
+                                  }
+                                  weekStartKey={getWeekStartKeyKST()}
+                                  last7DaysCounts={calcLast7Days(goalTrackEvents, track.id)}
+                                  onSave={handleSaveWeeklyReview}
+                                  saving={weeklyReviewSaving}
+                                />
                               </div>
                             ))}
                         </div>
@@ -3873,10 +4009,19 @@ export default function Home() {
                             NOT_ENOUGH_TIME_QUESTION_POOL
                           )
                         : [];
+                  const linkedGoalTrackId = getTodoGoalTrackId(todo);
+                  const linkedTrack = linkedGoalTrackId
+                    ? goalTracks.find((t) => t.id === linkedGoalTrackId)
+                    : null;
+                  const isEditingGoalLink = editingGoalLinkTodoId === todo.id;
                   return (
                 <div
                   key={todo.id}
-                  className="rounded-2xl border border-slate-100 px-3 py-3"
+                  className={`rounded-2xl border px-3 py-3 ${
+                    linkedGoalTrackId
+                      ? "border-l-2 border-l-slate-300 border-slate-100"
+                      : "border-slate-100"
+                  }`}
                 >
                   <label className="flex items-start gap-3 text-sm">
                     <input
@@ -3892,6 +4037,9 @@ export default function Home() {
                             todo.done ? "text-slate-400 line-through" : ""
                           }
                         >
+                          {linkedGoalTrackId && (
+                            <span className="mr-1.5 text-[10px] opacity-60" aria-hidden>🎯</span>
+                          )}
                           {todo.text}
                         </span>
                         <button
@@ -3902,12 +4050,34 @@ export default function Home() {
                           삭제
                         </button>
                       </div>
-                      {getTodoGoalTrackId(todo) && (
-                        <p className="mt-1 text-[11px] text-slate-400">
-                          →{" "}
-                          {goalTracks.find((t) => t.id === getTodoGoalTrackId(todo))?.title ??
-                            "목표"}
-                        </p>
+                      <div className="mt-1 flex items-center gap-2">
+                        <button
+                          type="button"
+                          className="text-[11px] text-slate-500 underline-offset-1 hover:underline"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            setEditingGoalLinkTodoId(isEditingGoalLink ? null : todo.id);
+                          }}
+                        >
+                          {linkedGoalTrackId ? "변경" : "목표 연결"}
+                        </button>
+                        {linkedTrack && !isEditingGoalLink && (
+                          <span className="text-[11px] text-slate-400">
+                            → {linkedTrack.title || "목표"}
+                          </span>
+                        )}
+                      </div>
+                      {isEditingGoalLink && (
+                        <InlineGoalLinkEditor
+                          designPlans={designPlans}
+                          goalTracks={goalTracks}
+                          currentGoalTrackId={linkedGoalTrackId}
+                          initialDesignPlanId={linkedTrack?.designPlanId ?? null}
+                          initialGoalTrackId={linkedGoalTrackId}
+                          onSave={(id) => handleUpdateTodoGoalTrackId(todo, id)}
+                          onCancel={() => setEditingGoalLinkTodoId(null)}
+                          onUnlink={() => handleUpdateTodoGoalTrackId(todo, null)}
+                        />
                       )}
                       {dueAtMillis !== null && (
                         <p

@@ -45,6 +45,23 @@ export const getLastNDateKeys = (n: number, date: Date = new Date()): string[] =
   return keys;
 };
 
+/** 최근 N주 월요일 dateKey 배열 (이번 주 포함, 중복 제거) */
+export const getWeekStartKeysForLastNWeeks = (n: number): string[] => {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  const now = new Date();
+  for (let i = 0; i < n; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i * 7);
+    const k = getWeekStartKeyKST(d);
+    if (!seen.has(k)) {
+      seen.add(k);
+      keys.push(k);
+    }
+  }
+  return keys;
+};
+
 /** dateKey 문자열 비교 (a < b) */
 export const isDateKeyBefore = (a: string, b: string): boolean => a < b;
 
