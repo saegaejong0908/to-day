@@ -23,6 +23,7 @@ import {
   serverTimestamp,
   setDoc,
   updateDoc,
+  writeBatch,
 } from "firebase/firestore";
 import { auth, db, firebaseConfigMissingKeys } from "@/lib/firebase";
 import {
@@ -49,8 +50,12 @@ import {
   initialEffectState,
 } from "@/store/effectReducer";
 import { MissedReasonType } from "@/types/missed-reason";
-import type { YearGoal } from "@/types/goal";
 import type { RecordItem } from "@/types/record";
+import type { DesignPlan } from "@/types/designPlan";
+import type { GoalTrack } from "@/types/goalTrack";
+import type { GoalTrackEvent } from "@/types/goalTrackEvent";
+import { buildEventId } from "@/domain/execution";
+import { ExecutionEvidenceCard } from "@/components/design/ExecutionEvidenceCard";
 
 const USER_TYPES = ["neutral"] as const;
 type UserType = (typeof USER_TYPES)[number];
@@ -68,24 +73,13 @@ type Settings = {
   protectStart: string;
   protectEnd: string;
   distractionApps?: DistractionApp[];
-  wakeRoutine?: RoutineItem[];
+  wakeRoutine?: RoutineCollection | RoutineItem[];
 };
 
 type DayLog = {
   did: string;
   learned: string;
   reviewedAt?: unknown | null;
-};
-
-type WeeklyActionTodo = {
-  id: string;
-  text: string;
-  weekdays: number[];
-};
-
-type WeeklyActionPlanResult = {
-  rationale: string;
-  todos: WeeklyActionTodo[];
 };
 
 type TodoItem = {
@@ -98,7 +92,11 @@ type TodoItem = {
   dueAt?: unknown;
   missedReasonType?: MissedReasonType | null;
   goalId?: string | null;
+  goalTrackId?: string | null;
 };
+
+const getTodoGoalTrackId = (todo: TodoItem): string | null =>
+  todo.goalTrackId ?? null;
 
 type CalendarEvent = {
   id: string;
@@ -123,9 +121,30 @@ type DistractionApp = {
   minutes: number;
 };
 
+type RoutineType = "morning" | "night" | "custom";
+type RoutineTriggerType = "alarm" | "manual" | "location";
+
+type RoutineTask = {
+  id: string;
+  title: string;
+  completed: boolean;
+};
+
 type RoutineItem = {
   id: string;
-  text: string;
+  title: string;
+  type: RoutineType;
+  triggerType?: RoutineTriggerType;
+  tasks: RoutineTask[];
+  streak: number;
+  totalCompletedDays: number;
+  monthlySuccessRate: number;
+  lastCompletedDate: string;
+  completionHistory?: string[];
+};
+
+type RoutineCollection = {
+  routines: RoutineItem[];
 };
 
 type WakeAlarm = {
@@ -143,12 +162,182 @@ const defaultSettings: Settings = {
   protectEnabled: true,
   protectStart: "07:00",
   protectEnd: "12:00",
-  wakeRoutine: [],
+  wakeRoutine: { routines: [] },
   distractionApps: [
     { id: "insta", label: "인스타그램", minutes: 5 },
     { id: "youtube", label: "유튜브", minutes: 5 },
     { id: "kakao", label: "카카오톡", minutes: 5 },
   ],
+};
+
+const ROUTINE_STREAK_GRACE_DAYS = 2;
+
+const parseDateKeyToDate = (value: string) => {
+  const [year, month, day] = value.split("-").map((part) => Number(part));
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day);
+};
+
+const diffDaysBetweenDateKeys = (from: string, to: string) => {
+  const fromDate = parseDateKeyToDate(from);
+  const toDate = parseDateKeyToDate(to);
+  if (!fromDate || !toDate) return null;
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  return Math.floor((toDate.getTime() - fromDate.getTime()) / MS_PER_DAY);
+};
+
+const calculateMonthlySuccessRate = (
+  completionHistory: string[],
+  todayDateKey: string
+) => {
+  const todayDate = parseDateKeyToDate(todayDateKey) ?? new Date();
+  const monthPrefix = getMonthKey(todayDate);
+  const elapsedDays = Math.max(1, todayDate.getDate());
+  const uniqueSuccessDays = new Set(
+    completionHistory.filter((dayKey) => dayKey.startsWith(monthPrefix))
+  );
+  return Math.round((uniqueSuccessDays.size / elapsedDays) * 100);
+};
+
+const makeDefaultRoutine = (
+  routineId = `routine-${Date.now()}`,
+  tasks: RoutineTask[] = []
+): RoutineItem => ({
+  id: routineId,
+  title: "아침 루틴",
+  type: "morning",
+  triggerType: "alarm",
+  tasks,
+  streak: 0,
+  totalCompletedDays: 0,
+  monthlySuccessRate: 0,
+  lastCompletedDate: "",
+  completionHistory: [],
+});
+
+const normalizeRoutineTask = (task: unknown, index: number): RoutineTask | null => {
+  if (typeof task === "string") {
+    const title = task.trim();
+    if (!title) return null;
+    return { id: `${Date.now()}-task-${index}`, title, completed: false };
+  }
+  if (!task || typeof task !== "object") return null;
+  const candidate = task as Partial<RoutineTask> & { text?: string };
+  const title =
+    typeof candidate.title === "string"
+      ? candidate.title.trim()
+      : typeof candidate.text === "string"
+        ? candidate.text.trim()
+        : "";
+  if (!title) return null;
+  return {
+    id:
+      typeof candidate.id === "string" && candidate.id
+        ? candidate.id
+        : `${Date.now()}-task-${index}`,
+    title,
+    completed: Boolean(candidate.completed),
+  };
+};
+
+const normalizeRoutineItem = (
+  routine: unknown,
+  index: number,
+  todayDateKey: string
+): RoutineItem | null => {
+  if (!routine || typeof routine !== "object") return null;
+  const candidate = routine as Partial<RoutineItem> & {
+    text?: string;
+    tasks?: unknown[];
+  };
+  const title =
+    typeof candidate.title === "string"
+      ? candidate.title
+      : typeof candidate.text === "string" && candidate.text.trim()
+        ? candidate.text.trim()
+        : `루틴 ${index + 1}`;
+  const tasks = Array.isArray(candidate.tasks)
+    ? candidate.tasks
+        .map((task, taskIndex) => normalizeRoutineTask(task, taskIndex))
+        .filter((task): task is RoutineTask => Boolean(task))
+    : [];
+  const completionHistory = Array.isArray(candidate.completionHistory)
+    ? candidate.completionHistory.filter(
+        (item): item is string => typeof item === "string" && item.length > 0
+      )
+    : [];
+  return {
+    id:
+      typeof candidate.id === "string" && candidate.id
+        ? candidate.id
+        : `${Date.now()}-routine-${index}`,
+    title,
+    type:
+      candidate.type === "morning" || candidate.type === "night" || candidate.type === "custom"
+        ? candidate.type
+        : "morning",
+    triggerType:
+      candidate.triggerType === "alarm" ||
+      candidate.triggerType === "manual" ||
+      candidate.triggerType === "location"
+        ? candidate.triggerType
+        : "alarm",
+    tasks,
+    streak:
+      typeof candidate.streak === "number" && candidate.streak >= 0
+        ? candidate.streak
+        : 0,
+    totalCompletedDays:
+      typeof candidate.totalCompletedDays === "number" && candidate.totalCompletedDays >= 0
+        ? candidate.totalCompletedDays
+        : completionHistory.length,
+    monthlySuccessRate: calculateMonthlySuccessRate(completionHistory, todayDateKey),
+    lastCompletedDate:
+      typeof candidate.lastCompletedDate === "string" ? candidate.lastCompletedDate : "",
+    completionHistory,
+  };
+};
+
+const extractRoutineArray = (raw: unknown): unknown[] => {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object" && Array.isArray((raw as { routines?: unknown }).routines)) {
+    return (raw as { routines: unknown[] }).routines;
+  }
+  return [];
+};
+
+const toRoutineCollection = (routines: RoutineItem[]): RoutineCollection => ({
+  routines,
+});
+
+const getRoutineDisplayTitle = (title: string, fallbackIndex: number) => {
+  const trimmed = title.trim();
+  return trimmed.length > 0 ? trimmed : `루틴 ${fallbackIndex + 1}`;
+};
+
+const normalizeWakeRoutine = (raw: unknown, todayDateKey: string): RoutineItem[] => {
+  const source = extractRoutineArray(raw);
+  if (source.length === 0) {
+    return [];
+  }
+  const looksLikeLegacyTaskArray = source.some((item) => {
+    if (typeof item === "string") return true;
+    if (!item || typeof item !== "object") return false;
+    return (
+      "text" in item &&
+      typeof (item as { text?: unknown }).text === "string" &&
+      !("tasks" in item)
+    );
+  });
+  if (looksLikeLegacyTaskArray) {
+    const tasks = source
+      .map((item, index) => normalizeRoutineTask(item, index))
+      .filter((item): item is RoutineTask => Boolean(item));
+    return [makeDefaultRoutine("morning-default", tasks)];
+  }
+  return source
+    .map((item, index) => normalizeRoutineItem(item, index, todayDateKey))
+    .filter((item): item is RoutineItem => Boolean(item));
 };
 
 const EFFECT_OPTIONS: Array<{
@@ -460,7 +649,21 @@ export default function Home() {
   const [newTodo, setNewTodo] = useState("");
   const [newTodoDueAt, setNewTodoDueAt] = useState("");
   const [linkNewTodoToGoal, setLinkNewTodoToGoal] = useState(false);
-  const [newTodoGoalId, setNewTodoGoalId] = useState("");
+  const [newTodoDesignPlanId, setNewTodoDesignPlanId] = useState("");
+  const [newTodoGoalTrackId, setNewTodoGoalTrackId] = useState("");
+  const [designPlans, setDesignPlans] = useState<DesignPlan[]>([]);
+  const [goalTracks, setGoalTracks] = useState<GoalTrack[]>([]);
+  const [selectedDesignPlanId, setSelectedDesignPlanId] = useState<string | null>(null);
+  const [newDesignPlanTitle, setNewDesignPlanTitle] = useState("");
+  const [newGoalTrackTitle, setNewGoalTrackTitle] = useState("");
+  const [editingDesignPlanId, setEditingDesignPlanId] = useState<string | null>(null);
+  const [editingDesignPlanTitle, setEditingDesignPlanTitle] = useState("");
+  const [editingGoalTrackId, setEditingGoalTrackId] = useState<string | null>(null);
+  const [editingGoalTrackTitle, setEditingGoalTrackTitle] = useState("");
+  const [addingTodoForGoalTrackId, setAddingTodoForGoalTrackId] = useState<string | null>(null);
+  const [goalTrackTodoText, setGoalTrackTodoText] = useState("");
+  const [goalTrackTodoDueAt, setGoalTrackTodoDueAt] = useState("");
+  const [goalTrackEvents, setGoalTrackEvents] = useState<GoalTrackEvent[]>([]);
   const [todayKey, setTodayKey] = useState(getLocalDateKey());
   const [yesterdayKey, setYesterdayKey] = useState(getYesterdayKey());
   const [currentMonth, setCurrentMonth] = useState(new Date());
@@ -478,6 +681,8 @@ export default function Home() {
   );
   const [newAppLabel, setNewAppLabel] = useState("");
   const [newRoutineText, setNewRoutineText] = useState("");
+  const [wakeScreen, setWakeScreen] = useState<"list" | "execute" | "edit">("list");
+  const [selectedWakeRoutineId, setSelectedWakeRoutineId] = useState<string | null>(null);
   const [nowMinutes, setNowMinutes] = useState(() => {
     const now = new Date();
     return now.getHours() * 60 + now.getMinutes();
@@ -515,35 +720,12 @@ export default function Home() {
     {}
   );
   const [todoAIError, setTodoAIError] = useState<Record<string, string>>({});
-  const [yearGoals, setYearGoals] = useState<YearGoal[]>([]);
-  const [yearGoalInput, setYearGoalInput] = useState("");
-  const [currentStatusInput, setCurrentStatusInput] = useState("");
-  const [dailyAvailableTimeInput, setDailyAvailableTimeInput] = useState("");
-  const [weakestAreaInput, setWeakestAreaInput] = useState("");
-  const [positionNoteInput, setPositionNoteInput] = useState("");
-  const [threeMonthGoalInput, setThreeMonthGoalInput] = useState("");
-  const [weeklyStateInput, setWeeklyStateInput] = useState("");
-  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
-  const [isCreatingNewGoal, setIsCreatingNewGoal] = useState(false);
-  const [showGoalPicker, setShowGoalPicker] = useState(false);
-  const [goalSaving, setGoalSaving] = useState(false);
-  const [goalSaveError, setGoalSaveError] = useState("");
-  const [weeklyActionPlan, setWeeklyActionPlan] =
-    useState<WeeklyActionPlanResult | null>(null);
-  const [weeklyActionError, setWeeklyActionError] = useState("");
-  const [weeklyActionLoading, setWeeklyActionLoading] = useState(false);
-  const [weeklyAddedFeedback, setWeeklyAddedFeedback] = useState<
-    Record<string, boolean>
-  >({});
-  const [weekdayPickerTodoId, setWeekdayPickerTodoId] = useState<string | null>(
-    null
-  );
   const [todoModalOpen, setTodoModalOpen] = useState(false);
   const [todoDraftText, setTodoDraftText] = useState("");
   const [todoPolishLoading, setTodoPolishLoading] = useState(false);
   const [todoPolishError, setTodoPolishError] = useState("");
   const [recordDraft, setRecordDraft] = useState("");
-  const [recordGoalId, setRecordGoalId] = useState<string>("");
+  const [recordGoalTrackId, setRecordGoalTrackId] = useState<string>("");
   const [recordsThisMonth, setRecordsThisMonth] = useState<RecordItem[]>([]);
   const [logSection, setLogSection] = useState<"daily" | "record">(
     "daily"
@@ -577,32 +759,31 @@ export default function Home() {
     () => getProtectLogic(userType, { settings, nowMinutes }),
     [userType, settings, nowMinutes]
   );
-  const recordsByGoalId = useMemo(() => {
-    const map: Record<string, number> = {};
-    recordsThisMonth.forEach((record) => {
-      if (!record.goalId) return;
-      map[record.goalId] = (map[record.goalId] ?? 0) + 1;
-    });
-    return map;
-  }, [recordsThisMonth]);
-  const goalsWithProgress = useMemo(() => {
-    return yearGoals.map((goal) => {
-      const totalSteps = goal.weeklyActionPlan?.todos.length ?? 0;
-      const doneCount = recordsByGoalId[goal.id] ?? 0;
-      const progress =
-        totalSteps > 0 ? Math.min(100, Math.round((doneCount / totalSteps) * 100)) : 0;
-      return { ...goal, progress };
-    });
-  }, [yearGoals, recordsByGoalId]);
-  const selectedGoalProgress = useMemo(() => {
-    if (!selectedGoalId) return { completed: 0, total: 0, percent: 0 };
-    const linkedTodos = todos.filter((todo) => todo.goalId === selectedGoalId);
-    const total = linkedTodos.length;
-    const completed = linkedTodos.filter((todo) => todo.done).length;
-    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
-    return { completed, total, percent };
-  }, [selectedGoalId, todos]);
   const thisMonthRecordCount = recordsThisMonth.length;
+  const wakeRoutines = useMemo(
+    () => normalizeWakeRoutine(settingsDraft.wakeRoutine, todayKey),
+    [settingsDraft.wakeRoutine, todayKey]
+  );
+  const activeWakeRoutine = useMemo(() => {
+    if (wakeRoutines.length === 0) return null;
+    if (selectedWakeRoutineId) {
+      return wakeRoutines.find((routine) => routine.id === selectedWakeRoutineId) ?? null;
+    }
+    return wakeRoutines[0];
+  }, [wakeRoutines, selectedWakeRoutineId]);
+  const activeWakeRoutineIndex = useMemo(() => {
+    if (!activeWakeRoutine) return -1;
+    return wakeRoutines.findIndex((routine) => routine.id === activeWakeRoutine.id);
+  }, [activeWakeRoutine, wakeRoutines]);
+  const activeWakeRoutineAllDone = useMemo(() => {
+    if (!activeWakeRoutine) return false;
+    if (activeWakeRoutine.tasks.length === 0) return false;
+    return activeWakeRoutine.tasks.every((task) => task.completed);
+  }, [activeWakeRoutine]);
+  const activeWakeRoutineCompletedToday = useMemo(() => {
+    if (!activeWakeRoutine) return false;
+    return activeWakeRoutine.lastCompletedDate === todayKey;
+  }, [activeWakeRoutine, todayKey]);
   const uiCard = "rounded-3xl bg-white p-6 shadow-sm";
   const uiPrimaryButton =
     "h-11 w-full rounded-full bg-slate-900 px-4 text-xs font-semibold text-white transition-colors hover:bg-slate-800";
@@ -611,75 +792,6 @@ export default function Home() {
   const uiDangerButton =
     "h-11 rounded-full border border-rose-200 bg-white px-4 text-xs font-semibold text-rose-500 transition-colors hover:bg-rose-50";
   const uiInputPanel = "rounded-2xl border border-slate-100 bg-slate-50 p-3";
-  const WEEKDAY_OPTIONS: Array<{ value: number; label: string }> = [
-    { value: 1, label: "월" },
-    { value: 2, label: "화" },
-    { value: 3, label: "수" },
-    { value: 4, label: "목" },
-    { value: 5, label: "금" },
-    { value: 6, label: "토" },
-    { value: 0, label: "일" },
-  ];
-  const makeWeeklyActionTodo = (
-    text = "",
-    weekdays: number[] = []
-  ): WeeklyActionTodo => ({
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    text,
-    weekdays,
-  });
-
-  useEffect(() => {
-    if (yearGoals.length === 0) {
-      setSelectedGoalId(null);
-      setIsCreatingNewGoal(true);
-      setYearGoalInput("");
-      setDailyAvailableTimeInput("");
-      setCurrentStatusInput("");
-      setWeakestAreaInput("");
-      setPositionNoteInput("");
-      setThreeMonthGoalInput("");
-      setWeeklyStateInput("");
-      setWeeklyActionPlan(null);
-      setWeeklyActionError("");
-      setWeeklyAddedFeedback({});
-      setWeekdayPickerTodoId(null);
-      return;
-    }
-    if (isCreatingNewGoal) return;
-    if (selectedGoalId && yearGoals.some((goal) => goal.id === selectedGoalId)) return;
-    setSelectedGoalId(yearGoals[0].id);
-  }, [yearGoals, selectedGoalId, isCreatingNewGoal]);
-
-  useEffect(() => {
-    if (!selectedGoalId) return;
-    const selectedGoal = yearGoals.find((goal) => goal.id === selectedGoalId);
-    if (!selectedGoal) return;
-    setIsCreatingNewGoal(false);
-    setYearGoalInput(selectedGoal.yearGoal);
-    setDailyAvailableTimeInput(selectedGoal.deadlineDate ?? "");
-    setCurrentStatusInput(selectedGoal.currentPosition.currentStatus);
-    setWeakestAreaInput(selectedGoal.currentPosition.weakestArea);
-    setPositionNoteInput(
-      selectedGoal.currentPosition.note || selectedGoal.currentPosition.weakestArea
-    );
-    setThreeMonthGoalInput(selectedGoal.threeMonthGoal);
-    setWeeklyStateInput(selectedGoal.weeklyState ?? selectedGoal.threeMonthGoal);
-    setWeeklyActionPlan(
-      selectedGoal.weeklyActionPlan && selectedGoal.weeklyActionPlan.todos.length > 0
-        ? {
-            rationale: selectedGoal.weeklyActionPlan.rationale,
-            todos: selectedGoal.weeklyActionPlan.todos.map((todo) =>
-              makeWeeklyActionTodo(todo.text, todo.weekdays ?? [])
-            ),
-          }
-        : null
-    );
-    setWeeklyAddedFeedback({});
-    setWeekdayPickerTodoId(null);
-    setWeeklyActionError("");
-    setRecordGoalId(selectedGoal.id);
-  }, [selectedGoalId, yearGoals]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -710,6 +822,49 @@ export default function Home() {
   useEffect(() => {
     setSettingsDraft(settings);
   }, [settings]);
+
+  useEffect(() => {
+    if (!user || !db) return;
+    setSettingsDraft((prev) => {
+      const current = normalizeWakeRoutine(prev.wakeRoutine, todayKey);
+      let changed = false;
+      const nextWakeRoutine = current.map((routine) => {
+        const shouldReset =
+          routine.lastCompletedDate !== todayKey && routine.tasks.some((task) => task.completed);
+        const nextMonthlySuccessRate = calculateMonthlySuccessRate(
+          routine.completionHistory ?? [],
+          todayKey
+        );
+        if (!shouldReset && nextMonthlySuccessRate === routine.monthlySuccessRate) {
+          return routine;
+        }
+        changed = true;
+        return {
+          ...routine,
+          tasks: shouldReset
+            ? routine.tasks.map((task) => ({ ...task, completed: false }))
+            : routine.tasks,
+          monthlySuccessRate: nextMonthlySuccessRate,
+        };
+      });
+      if (changed && db && user) {
+        const settingsRef = doc(db, "users", user.uid, "settings", "main");
+        void setDoc(
+          settingsRef,
+          {
+            wakeRoutine: toRoutineCollection(nextWakeRoutine),
+          },
+          { merge: true }
+        );
+      }
+      return changed
+        ? {
+            ...prev,
+            wakeRoutine: toRoutineCollection(nextWakeRoutine),
+          }
+        : prev;
+    });
+  }, [todayKey, user, db]);
 
   useEffect(() => {
     if (!wakeSaved) return;
@@ -754,26 +909,24 @@ export default function Home() {
       setYesterdayLog(null);
       setYesterdayExists(false);
       setTodos([]);
-      setYearGoals([]);
-      setYearGoalInput("");
-      setCurrentStatusInput("");
-      setDailyAvailableTimeInput("");
-      setWeakestAreaInput("");
-      setPositionNoteInput("");
-      setThreeMonthGoalInput("");
-      setWeeklyStateInput("");
-      setSelectedGoalId(null);
-      setGoalSaving(false);
-      setGoalSaveError("");
-      setWeeklyActionPlan(null);
-      setWeeklyActionError("");
-      setWeeklyActionLoading(false);
       setTodoModalOpen(false);
       setTodoDraftText("");
       setTodoPolishLoading(false);
       setTodoPolishError("");
       setLinkNewTodoToGoal(false);
-      setNewTodoGoalId("");
+      setNewTodoDesignPlanId("");
+      setNewTodoGoalTrackId("");
+      setDesignPlans([]);
+      setGoalTracks([]);
+      setSelectedDesignPlanId(null);
+      setEditingDesignPlanId(null);
+      setEditingDesignPlanTitle("");
+      setEditingGoalTrackId(null);
+      setEditingGoalTrackTitle("");
+      setAddingTodoForGoalTrackId(null);
+      setGoalTrackTodoText("");
+      setGoalTrackTodoDueAt("");
+      setGoalTrackEvents([]);
       setRecordsThisMonth([]);
       return;
     }
@@ -794,24 +947,7 @@ export default function Home() {
       const nextUserType = isUserType(data.userType)
         ? data.userType
         : defaultSettings.userType;
-      const nextRoutine =
-        Array.isArray(data.wakeRoutine) && data.wakeRoutine.length > 0
-          ? data.wakeRoutine
-              .map((item, index) => {
-                if (typeof item === "string") {
-                  return { id: `${Date.now()}-${index}`, text: item };
-                }
-                const text =
-                  typeof item?.text === "string" ? item.text.trim() : "";
-                if (!text) return null;
-                const id =
-                  typeof item?.id === "string" && item.id
-                    ? item.id
-                    : `${Date.now()}-${index}`;
-                return { id, text };
-              })
-              .filter((item): item is RoutineItem => Boolean(item))
-          : [];
+      const nextRoutine = normalizeWakeRoutine(data.wakeRoutine, todayKey);
       const nextApps =
         Array.isArray(data.distractionApps) && data.distractionApps.length > 0
           ? data.distractionApps.map((app) => ({
@@ -882,7 +1018,7 @@ export default function Home() {
           primaryWakeTime ??
           defaultSettings.protectStart,
         protectEnd: data.protectEnd ?? defaultSettings.protectEnd,
-        wakeRoutine: nextRoutine,
+        wakeRoutine: toRoutineCollection(nextRoutine),
         distractionApps: nextApps,
       });
       setWakeConsent(
@@ -896,7 +1032,7 @@ export default function Home() {
             ? data.wakeEnabled
             : nextWakeTimes.length > 0,
         wakeConsent: data.wakeConsent ?? defaultSettings.wakeConsent,
-        wakeRoutine: nextRoutine,
+        wakeRoutine: toRoutineCollection(nextRoutine),
         wakeTimes: nextWakeTimes,
         wakeTime: primaryWakeTime,
       }));
@@ -944,119 +1080,73 @@ export default function Home() {
           dueAt: data.dueAt,
           missedReasonType: normalizeMissedReasonType(data.missedReasonType),
           goalId: typeof data.goalId === "string" ? data.goalId : null,
+          goalTrackId: typeof data.goalTrackId === "string" ? data.goalTrackId : null,
         };
       });
       setTodos(nextTodos);
     });
 
-    const goalsRef = collection(db, "users", user.uid, "yearGoals");
-    const goalsQuery = query(goalsRef, orderBy("createdAt", "desc"));
-    const unsubscribeGoals = onSnapshot(goalsQuery, (snapshot) => {
-      const nextGoals: YearGoal[] = snapshot.docs.map((item) => {
-        const data = item.data() as Partial<YearGoal>;
+    const toCreatedAtString = (v: unknown): string => {
+      if (typeof v === "string") return v;
+      const t = v as { toDate?: () => Date } | null;
+      if (t && typeof t.toDate === "function") return t.toDate().toISOString();
+      return "";
+    };
+
+    const designPlansRef = collection(db, "users", user.uid, "designPlans");
+    const designPlansQuery = query(designPlansRef, orderBy("createdAt", "asc"));
+    const unsubscribeDesignPlans = onSnapshot(designPlansQuery, (snapshot) => {
+      const next: DesignPlan[] = snapshot.docs.map((item) => {
+        const data = item.data();
+        return {
+          id: item.id,
+          title: typeof data.title === "string" ? data.title : "",
+          createdAt: toCreatedAtString(data.createdAt) || "",
+        };
+      });
+      setDesignPlans(next);
+    });
+
+    const goalTracksRef = collection(db, "users", user.uid, "goalTracks");
+    const goalTracksQuery = query(goalTracksRef, orderBy("createdAt", "asc"));
+    const unsubscribeGoalTracks = onSnapshot(goalTracksQuery, (snapshot) => {
+      const next: GoalTrack[] = snapshot.docs.map((item) => {
+        const data = item.data();
+        return {
+          id: item.id,
+          designPlanId: typeof data.designPlanId === "string" ? data.designPlanId : "",
+          title: typeof data.title === "string" ? data.title : "",
+          createdAt: toCreatedAtString(data.createdAt) || "",
+        };
+      });
+      setGoalTracks(next);
+    });
+
+    const goalTrackEventsRef = collection(db, "users", user.uid, "goalTrackEvents");
+    const goalTrackEventsQuery = query(
+      goalTrackEventsRef,
+      orderBy("createdAt", "desc"),
+      limit(150)
+    );
+    const unsubscribeGoalTrackEvents = onSnapshot(goalTrackEventsQuery, (snapshot) => {
+      const next: GoalTrackEvent[] = snapshot.docs.map((item) => {
+        const data = item.data();
         const createdAt =
-          typeof (data.createdAt as unknown as { toDate?: () => Date })?.toDate ===
-          "function"
+          typeof (data.createdAt as unknown as { toDate?: () => Date })?.toDate === "function"
             ? (data.createdAt as unknown as { toDate: () => Date }).toDate()
             : data.createdAt instanceof Date
               ? data.createdAt
               : new Date();
-        const legacyRoadmap = (data as unknown as {
-          roadmap?: { monthlyPlan?: string[] };
-          title?: string;
-          yearlyTarget?: string;
-        }).roadmap;
-        const legacyTitle = (data as unknown as { title?: string }).title;
-        const legacyYearlyTarget = (data as unknown as { yearlyTarget?: string })
-          .yearlyTarget;
-        const yearGoal =
-          typeof data.yearGoal === "string"
-            ? data.yearGoal
-            : typeof legacyTitle === "string"
-              ? legacyTitle
-              : typeof legacyYearlyTarget === "string"
-                ? legacyYearlyTarget
-                : "";
-        const threeMonthGoal =
-          typeof data.threeMonthGoal === "string"
-            ? data.threeMonthGoal
-            : Array.isArray(legacyRoadmap?.monthlyPlan)
-              ? legacyRoadmap?.monthlyPlan.join("\n")
-              : "";
-        const weeklyState =
-          typeof (data as { weeklyState?: unknown }).weeklyState === "string"
-            ? ((data as { weeklyState?: string }).weeklyState ?? "")
-            : threeMonthGoal;
-        const weeklyActionPlanRaw = (data.weeklyActionPlan ?? {}) as Partial<
-          NonNullable<YearGoal["weeklyActionPlan"]>
-        >;
-        const normalizedWeeklyTodos = Array.isArray(weeklyActionPlanRaw.todos)
-          ? weeklyActionPlanRaw.todos
-              .map((todo) => {
-                if (typeof todo === "string") {
-                  return makeWeeklyActionTodo(todo, []);
-                }
-                if (typeof todo?.text !== "string") return null;
-                const weekdays = Array.isArray(todo.weekdays)
-                  ? todo.weekdays
-                      .filter((day): day is number => typeof day === "number")
-                      .map((day) => ((day % 7) + 7) % 7)
-                  : typeof todo.weekday === "number"
-                    ? [((todo.weekday % 7) + 7) % 7]
-                    : [];
-                return makeWeeklyActionTodo(
-                  todo.text.trim(),
-                  weekdays
-                );
-              })
-              .filter((todo): todo is WeeklyActionTodo => Boolean(todo))
-              .filter((todo) => Boolean(todo.text))
-          : [];
-        const currentPositionRaw = (data.currentPosition ?? {}) as Partial<
-          YearGoal["currentPosition"]
-        >;
         return {
           id: item.id,
-          yearGoal,
-          currentPosition: {
-            currentStatus:
-              typeof currentPositionRaw.currentStatus === "string"
-                ? currentPositionRaw.currentStatus
-                : "",
-            dailyAvailableTime:
-              typeof currentPositionRaw.dailyAvailableTime === "string"
-                ? currentPositionRaw.dailyAvailableTime
-                : "",
-            weakestArea:
-              typeof currentPositionRaw.weakestArea === "string"
-                ? currentPositionRaw.weakestArea
-                : "",
-            note: typeof currentPositionRaw.note === "string" ? currentPositionRaw.note : "",
-          },
-          deadlineDate:
-            typeof data.deadlineDate === "string" ? data.deadlineDate : "",
-          threeMonthGoal,
-          weeklyState,
-          weeklyActionPlan: {
-            weekKey:
-              typeof weeklyActionPlanRaw.weekKey === "string"
-                ? weeklyActionPlanRaw.weekKey
-                : "",
-            rationale:
-              typeof weeklyActionPlanRaw.rationale === "string"
-                ? weeklyActionPlanRaw.rationale
-                : "",
-            todos: normalizedWeeklyTodos,
-            achievedRate:
-              typeof weeklyActionPlanRaw.achievedRate === "number"
-                ? weeklyActionPlanRaw.achievedRate
-                : undefined,
-          },
-          progress: typeof data.progress === "number" ? data.progress : 0,
+          goalTrackId: typeof data.goalTrackId === "string" ? data.goalTrackId : "",
+          todoId: typeof data.todoId === "string" ? data.todoId : "",
+          todoText: typeof data.todoText === "string" ? data.todoText : "",
+          dateKey: typeof data.dateKey === "string" ? data.dateKey : "",
           createdAt,
         };
       });
-      setYearGoals(nextGoals);
+      setGoalTrackEvents(next);
     });
 
     const recordsRef = collection(db, "users", user.uid, "records");
@@ -1086,6 +1176,7 @@ export default function Home() {
           id: item.id,
           content: typeof data.content === "string" ? data.content : "",
           goalId: typeof data.goalId === "string" ? data.goalId : undefined,
+          goalTrackId: typeof data.goalTrackId === "string" ? data.goalTrackId : undefined,
           createdAt,
         };
       });
@@ -1097,7 +1188,9 @@ export default function Home() {
       unsubscribeToday();
       unsubscribeYesterday();
       unsubscribeTodos();
-      unsubscribeGoals();
+      unsubscribeDesignPlans();
+      unsubscribeGoalTracks();
+      unsubscribeGoalTrackEvents();
       unsubscribeRecords();
     };
   }, [user, todayKey, yesterdayKey]);
@@ -1220,6 +1313,26 @@ export default function Home() {
     if (typeof window === "undefined") return;
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "wake") return;
+    setWakeScreen("list");
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (wakeRoutines.length === 0) {
+      setSelectedWakeRoutineId(null);
+      return;
+    }
+    if (!selectedWakeRoutineId) {
+      setSelectedWakeRoutineId(wakeRoutines[0].id);
+      return;
+    }
+    const exists = wakeRoutines.some((routine) => routine.id === selectedWakeRoutineId);
+    if (!exists) {
+      setSelectedWakeRoutineId(wakeRoutines[0].id);
+    }
+  }, [wakeRoutines, selectedWakeRoutineId]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !buildTime) return;
@@ -1403,14 +1516,32 @@ export default function Home() {
   const handleSaveWakeRoutine = async () => {
     if (!user || !db) return;
     const settingsRef = doc(db, "users", user.uid, "settings", "main");
+    const routinesToSave = normalizeWakeRoutine(settingsDraft.wakeRoutine, todayKey).map(
+      (routine, index) => ({
+        ...routine,
+        title: getRoutineDisplayTitle(routine.title, index),
+      })
+    );
     await setDoc(
       settingsRef,
       {
-        wakeRoutine: settingsDraft.wakeRoutine ?? [],
+        wakeRoutine: toRoutineCollection(routinesToSave),
       },
       { merge: true }
     );
     setRoutineSaved(true);
+  };
+
+  const persistWakeRoutine = async (routines: RoutineItem[]) => {
+    if (!user || !db) return;
+    const settingsRef = doc(db, "users", user.uid, "settings", "main");
+    await setDoc(
+      settingsRef,
+      {
+        wakeRoutine: toRoutineCollection(routines),
+      },
+      { merge: true }
+    );
   };
 
   const saveDistractionApps = async (apps: DistractionApp[]) => {
@@ -1448,11 +1579,11 @@ export default function Home() {
 
   const handleAddTodo = async () => {
     if (!user || !db || !newTodo.trim()) return;
-    if (linkNewTodoToGoal && !newTodoGoalId) return;
+    if (linkNewTodoToGoal && !newTodoGoalTrackId) return;
     const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
     const dueAtValue = newTodoDueAt ? new Date(newTodoDueAt) : null;
     const normalizedText = newTodo.trim();
-    const targetGoalId = linkNewTodoToGoal ? newTodoGoalId : null;
+    const targetGoalTrackId = linkNewTodoToGoal ? newTodoGoalTrackId : null;
     const dedupKey = [todayKey, normalizedText].join("::");
     const existsAlready = todos.some((todo) => todo.text.trim() === normalizedText);
     if (existsAlready || todoInsertInFlightRef.current.has(dedupKey)) return;
@@ -1468,7 +1599,7 @@ export default function Home() {
         effects: [],
         completedAt: null,
         dueAt: dueAtValue,
-        goalId: targetGoalId,
+        goalTrackId: targetGoalTrackId,
         createdAt: serverTimestamp(),
       });
     } finally {
@@ -1477,19 +1608,122 @@ export default function Home() {
     setNewTodo("");
     setNewTodoDueAt("");
     setLinkNewTodoToGoal(false);
-    setNewTodoGoalId("");
+    setNewTodoDesignPlanId("");
+    setNewTodoGoalTrackId("");
+  };
+
+  const handleAddDesignPlan = async () => {
+    if (!user || !db || !newDesignPlanTitle.trim()) return;
+    const ref = collection(db, "users", user.uid, "designPlans");
+    await addDoc(ref, {
+      title: newDesignPlanTitle.trim(),
+      createdAt: serverTimestamp(),
+    });
+    setNewDesignPlanTitle("");
+  };
+
+  const handleRenameDesignPlan = async (id: string, title: string) => {
+    if (!user || !db || !title.trim()) return;
+    const planRef = doc(db, "users", user.uid, "designPlans", id);
+    await updateDoc(planRef, { title: title.trim() });
+    setEditingDesignPlanId(null);
+    setEditingDesignPlanTitle("");
+  };
+
+  const nullifyGoalTrackIdInAllTodos = async (goalTrackId: string) => {
+    if (!db || !user) return;
+    const daysRef = collection(db, "users", user.uid, "days");
+    const daysSnap = await getDocs(daysRef);
+    let batch = writeBatch(db);
+    let batchCount = 0;
+    const BATCH_LIMIT = 450;
+    for (const dayDoc of daysSnap.docs) {
+      const todosRef = collection(db, "users", user.uid, "days", dayDoc.id, "todos");
+      const todosSnap = await getDocs(
+        query(todosRef, where("goalTrackId", "==", goalTrackId))
+      );
+      for (const todoDoc of todosSnap.docs) {
+        batch.update(todoDoc.ref, { goalTrackId: null });
+        batchCount++;
+        if (batchCount >= BATCH_LIMIT) {
+          await batch.commit();
+          batch = writeBatch(db);
+          batchCount = 0;
+        }
+      }
+    }
+    if (batchCount > 0) await batch.commit();
+  };
+
+  const handleDeleteDesignPlan = async (id: string) => {
+    if (!user || !db) return;
+    const tracksToDelete = goalTracks.filter((t) => t.designPlanId === id);
+    for (const track of tracksToDelete) {
+      await nullifyGoalTrackIdInAllTodos(track.id);
+    }
+    let batch = writeBatch(db);
+    for (const track of tracksToDelete) {
+      batch.delete(doc(db, "users", user.uid, "goalTracks", track.id));
+    }
+    batch.delete(doc(db, "users", user.uid, "designPlans", id));
+    await batch.commit();
+    if (selectedDesignPlanId === id) setSelectedDesignPlanId(null);
+  };
+
+  const handleAddGoalTrack = async () => {
+    if (!user || !db || !selectedDesignPlanId || !newGoalTrackTitle.trim()) return;
+    const ref = collection(db, "users", user.uid, "goalTracks");
+    await addDoc(ref, {
+      designPlanId: selectedDesignPlanId,
+      title: newGoalTrackTitle.trim(),
+      createdAt: serverTimestamp(),
+    });
+    setNewGoalTrackTitle("");
+  };
+
+  const handleRenameGoalTrack = async (id: string, title: string) => {
+    if (!user || !db || !title.trim()) return;
+    const trackRef = doc(db, "users", user.uid, "goalTracks", id);
+    await updateDoc(trackRef, { title: title.trim() });
+    setEditingGoalTrackId(null);
+    setEditingGoalTrackTitle("");
+  };
+
+  const handleAddTodoFromGoalTrack = async () => {
+    if (!user || !db || !addingTodoForGoalTrackId || !goalTrackTodoText.trim()) return;
+    const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
+    const dueAtValue = goalTrackTodoDueAt ? new Date(goalTrackTodoDueAt) : null;
+    await addDoc(todosRef, {
+      text: goalTrackTodoText.trim(),
+      done: false,
+      effects: [],
+      completedAt: null,
+      dueAt: dueAtValue,
+      goalTrackId: addingTodoForGoalTrackId,
+      createdAt: serverTimestamp(),
+    });
+    setAddingTodoForGoalTrackId(null);
+    setGoalTrackTodoText("");
+    setGoalTrackTodoDueAt("");
+  };
+
+  const handleDeleteGoalTrack = async (id: string) => {
+    if (!user || !db) return;
+    await nullifyGoalTrackIdInAllTodos(id);
+    const trackRef = doc(db, "users", user.uid, "goalTracks", id);
+    await deleteDoc(trackRef);
   };
 
   const handleAddAiTodoAsTodo = async (
     todoText: string,
-    goalId?: string,
+    goalTrackId?: string,
     targetDateKey?: string
   ) => {
     if (!user || !db || !todoText.trim()) return;
     const dateKey = targetDateKey ?? todayKey;
     const todosRef = collection(db, "users", user.uid, "days", dateKey, "todos");
     const normalizedText = todoText.trim();
-    const targetGoalId = goalId || null;
+    const targetGoalTrackId = goalTrackId || null;
     const dedupKey = [dateKey, normalizedText].join("::");
     if (todoInsertInFlightRef.current.has(dedupKey)) return;
     todoInsertInFlightRef.current.add(dedupKey);
@@ -1507,7 +1741,7 @@ export default function Home() {
         effects: [],
         completedAt: null,
         dueAt: null,
-        goalId: targetGoalId,
+        goalTrackId: targetGoalTrackId,
         createdAt: serverTimestamp(),
       });
     } finally {
@@ -1517,23 +1751,6 @@ export default function Home() {
 
   const handleToggleTodo = async (todo: TodoItem) => {
     if (!user || !db) return;
-    if (!todo.done) {
-      const todoRef = doc(
-        db,
-        "users",
-        user.uid,
-        "days",
-        todayKey,
-        "todos",
-        todo.id
-      );
-      await updateDoc(todoRef, {
-        done: true,
-        completedAt: serverTimestamp(),
-        effects: [],
-      });
-      return;
-    }
     const todoRef = doc(
       db,
       "users",
@@ -1543,7 +1760,34 @@ export default function Home() {
       "todos",
       todo.id
     );
+    const eventsRef = collection(db, "users", user.uid, "goalTrackEvents");
+    const goalTrackId = todo.goalTrackId ?? null;
+
+    if (!todo.done) {
+      await updateDoc(todoRef, {
+        done: true,
+        completedAt: serverTimestamp(),
+        effects: [],
+      });
+      if (goalTrackId) {
+        const eventId = buildEventId(goalTrackId, todo.id, todayKey);
+        const eventRef = doc(eventsRef, eventId);
+        await setDoc(eventRef, {
+          goalTrackId,
+          todoId: todo.id,
+          todoText: todo.text,
+          dateKey: todayKey,
+          createdAt: serverTimestamp(),
+        });
+      }
+      return;
+    }
     await updateDoc(todoRef, { done: false, completedAt: null, effects: [] });
+    if (goalTrackId) {
+      const eventId = buildEventId(goalTrackId, todo.id, todayKey);
+      const eventRef = doc(eventsRef, eventId);
+      await deleteDoc(eventRef);
+    }
   };
 
   const toggleEffectType = (type: EffectType) => {
@@ -1828,156 +2072,6 @@ export default function Home() {
     }
   };
 
-  const handleSaveGoalFields = async () => {
-    if (!user || !db) return;
-    const desiredOutcome = yearGoalInput.trim();
-    const middleGoalState = threeMonthGoalInput.trim();
-    const weeklyState = weeklyStateInput.trim();
-    if (!desiredOutcome) {
-      setGoalSaveError("원하는 결과를 먼저 입력해 주세요.");
-      return;
-    }
-
-    setGoalSaving(true);
-    setGoalSaveError("");
-    try {
-      const payload = {
-        yearGoal: desiredOutcome,
-        deadlineDate: dailyAvailableTimeInput.trim(),
-        currentPosition: {
-          currentStatus: currentStatusInput.trim(),
-          dailyAvailableTime: "",
-          weakestArea: weakestAreaInput.trim(),
-          note: positionNoteInput.trim(),
-        },
-        threeMonthGoal: middleGoalState,
-        weeklyState,
-        weeklyActionPlan: {
-          weekKey: todayKey,
-          rationale: weeklyActionPlan?.rationale ?? "",
-          todos:
-            weeklyActionPlan?.todos.map((todo) => ({
-              text: todo.text,
-              weekdays: todo.weekdays,
-            })) ?? [],
-        },
-        updatedAt: serverTimestamp(),
-      };
-
-      if (selectedGoalId) {
-        const goalRef = doc(db, "users", user.uid, "yearGoals", selectedGoalId);
-        await setDoc(goalRef, payload, { merge: true });
-        setIsCreatingNewGoal(false);
-      } else {
-        const goalsRef = collection(db, "users", user.uid, "yearGoals");
-        const ref = await addDoc(goalsRef, {
-          ...payload,
-          progress: 0,
-          createdAt: serverTimestamp(),
-        });
-        setIsCreatingNewGoal(false);
-        setSelectedGoalId(ref.id);
-        setRecordGoalId(ref.id);
-      }
-    } catch {
-      setGoalSaveError("목표 저장에 실패했어요. 다시 시도해 주세요.");
-    } finally {
-      setGoalSaving(false);
-    }
-  };
-
-  const handleGenerateWeeklyActionPlan = async () => {
-    const desiredOutcome = yearGoalInput.trim();
-    const weeklyState = weeklyStateInput.trim();
-    if (!desiredOutcome || !weeklyState) {
-      setWeeklyActionError("원하는 결과와 1주 뒤 상태를 먼저 작성해 주세요.");
-      return;
-    }
-    const seedTodos =
-      weeklyActionPlan?.todos
-        .map((todo) => todo.text.trim())
-        .filter(Boolean) ?? [];
-    if (seedTodos.length === 0) {
-      setWeeklyActionError("먼저 실행 항목을 직접 1개 이상 작성해 주세요.");
-      return;
-    }
-
-    setWeeklyActionError("");
-    setWeeklyActionLoading(true);
-    try {
-      const response = await fetch("/api/ai/weekly-action-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          deadlineDate: dailyAvailableTimeInput.trim(),
-          desiredOutcome,
-          requiredState: `${currentStatusInput.trim()}\n중간 목표 상태: ${threeMonthGoalInput.trim()}`,
-          weeklyState,
-          constraints: positionNoteInput.trim() || weakestAreaInput.trim(),
-          seedTodos,
-        }),
-      });
-      if (!response.ok) {
-        setWeeklyActionError("실행 분해에 실패했어요.");
-        return;
-      }
-      const data = (await response.json()) as {
-        result?: { rationale: string; todos: string[] } | null;
-      };
-      if (!data.result) {
-        setWeeklyActionError("실행 분해 결과가 비어 있어요.");
-        return;
-      }
-      setWeeklyActionPlan({
-        rationale: data.result.rationale,
-        todos: seedTodos.map((seedTodo, index) =>
-          makeWeeklyActionTodo(
-            data.result?.todos[index]?.trim() || seedTodo,
-            weeklyActionPlan?.todos[index]?.weekdays ?? []
-          )
-        ),
-      });
-      setWeeklyAddedFeedback({});
-      setWeekdayPickerTodoId(null);
-    } catch {
-      setWeeklyActionError("실행 분해 중 오류가 발생했어요.");
-    } finally {
-      setWeeklyActionLoading(false);
-    }
-  };
-
-  const getNextDateKeyByWeekday = (weekday: number): string => {
-    const now = new Date();
-    const todayWeekday = now.getDay();
-    let diff = (weekday - todayWeekday + 7) % 7;
-    const nextDate = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      now.getDate() + diff
-    );
-    return getLocalDateKey(nextDate);
-  };
-
-  const handleAddWeeklyPlannedTodo = async (todo: WeeklyActionTodo) => {
-    if (!todo.text.trim()) return;
-    if (todo.weekdays.length === 0) {
-      setWeeklyActionError("요일을 1개 이상 선택해 주세요.");
-      return;
-    }
-    const targetDateKeys = Array.from(
-      new Set(todo.weekdays.map((weekday) => getNextDateKeyByWeekday(weekday)))
-    );
-    await Promise.all(
-      targetDateKeys.map((dateKey) =>
-        handleAddAiTodoAsTodo(todo.text, selectedGoalId ?? undefined, dateKey)
-      )
-    );
-    setWeeklyAddedFeedback((prev) => ({ ...prev, [todo.id]: true }));
-    window.setTimeout(() => {
-      setWeeklyAddedFeedback((prev) => ({ ...prev, [todo.id]: false }));
-    }, 1200);
-  };
-
   const handlePolishTodoDraft = async () => {
     const rawTodo = todoDraftText.trim();
     if (!rawTodo) return;
@@ -2012,8 +2106,8 @@ export default function Home() {
   const handleSubmitGoalTodo = async () => {
     const text = todoDraftText.trim();
     if (!text) return;
-    const goalIdForTodo = selectedGoalId ?? (recordGoalId || undefined);
-    await handleAddAiTodoAsTodo(text, goalIdForTodo);
+    const goalTrackIdForTodo = recordGoalTrackId || undefined;
+    await handleAddAiTodoAsTodo(text, goalTrackIdForTodo);
     setTodoDraftText("");
     setTodoPolishError("");
     setTodoModalOpen(false);
@@ -2027,63 +2121,13 @@ export default function Home() {
       const recordsRef = collection(db, "users", user.uid, "records");
       await addDoc(recordsRef, {
         content,
-        goalId: recordGoalId || null,
+        goalTrackId: recordGoalTrackId || null,
         createdAt: serverTimestamp(),
       });
       setRecordDraft("");
-      setRecordGoalId(selectedGoalId ?? "");
     } catch {
       // ignore record save failures
     }
-  };
-
-  const handleDeleteYearGoal = async () => {
-    if (!user || !db || !selectedGoalId) return;
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm("선택한 목표를 삭제할까요?");
-      if (!confirmed) return;
-    }
-    try {
-      const goalRef = doc(db, "users", user.uid, "yearGoals", selectedGoalId);
-      await deleteDoc(goalRef);
-      setRecordGoalId((prev) => (prev === selectedGoalId ? "" : prev));
-      setIsCreatingNewGoal(true);
-      setShowGoalPicker(false);
-      setSelectedGoalId(null);
-      setYearGoalInput("");
-      setDailyAvailableTimeInput("");
-      setCurrentStatusInput("");
-      setWeakestAreaInput("");
-      setPositionNoteInput("");
-      setThreeMonthGoalInput("");
-      setWeeklyStateInput("");
-      setWeeklyActionPlan(null);
-      setWeeklyActionError("");
-      setWeeklyAddedFeedback({});
-      setWeekdayPickerTodoId(null);
-    } catch {
-      // ignore goal delete failures
-    }
-  };
-
-  const handleStartNewGoalDraft = () => {
-    setIsCreatingNewGoal(true);
-    setShowGoalPicker(false);
-    setSelectedGoalId(null);
-    setWeeklyActionPlan(null);
-    setWeeklyActionError("");
-    setWeeklyActionLoading(false);
-    setWeeklyAddedFeedback({});
-    setWeekdayPickerTodoId(null);
-    setGoalSaveError("");
-    setYearGoalInput("");
-    setCurrentStatusInput("");
-    setDailyAvailableTimeInput("");
-    setWeakestAreaInput("");
-    setPositionNoteInput("");
-    setThreeMonthGoalInput("");
-    setWeeklyStateInput("");
-    setRecordGoalId("");
   };
 
   const handleAddEvent = async () => {
@@ -2205,26 +2249,163 @@ export default function Home() {
     saveDistractionApps(nextApps);
   };
 
+  const updateWakeRoutineInDraft = (
+    updater: (routines: RoutineItem[]) => RoutineItem[],
+    options?: { persist?: boolean }
+  ) => {
+    setSettingsDraft((prev) => {
+      const current = normalizeWakeRoutine(prev.wakeRoutine, todayKey);
+      const nextWakeRoutine = updater(current);
+      if (options?.persist) {
+        void persistWakeRoutine(nextWakeRoutine);
+      }
+      return {
+        ...prev,
+        wakeRoutine: toRoutineCollection(nextWakeRoutine),
+      };
+    });
+  };
+
   const handleAddRoutine = () => {
     const trimmed = newRoutineText.trim();
     if (!trimmed) return;
-    setSettingsDraft((prev) => ({
-      ...prev,
-      wakeRoutine: [
-        ...(prev.wakeRoutine ?? []),
-        { id: `${Date.now()}`, text: trimmed },
-      ],
-    }));
+    updateWakeRoutineInDraft((routines) => {
+      const routine =
+        routines.find((item) => item.id === selectedWakeRoutineId) ?? routines[0];
+      if (!routine) {
+        const createdRoutineId = `routine-${Date.now()}`;
+        setSelectedWakeRoutineId(createdRoutineId);
+        return [makeDefaultRoutine(createdRoutineId, [{ id: `${Date.now()}-task`, title: trimmed, completed: false }])];
+      }
+      return routines.map((item) =>
+        item.id === routine.id
+          ? {
+              ...item,
+              tasks: [
+                ...item.tasks,
+                { id: `${Date.now()}-task`, title: trimmed, completed: false },
+              ],
+            }
+          : item
+      );
+    });
     setNewRoutineText("");
   };
 
-  const handleRemoveRoutine = (routineId: string) => {
-    setSettingsDraft((prev) => ({
-      ...prev,
-      wakeRoutine: (prev.wakeRoutine ?? []).filter(
-        (routine) => routine.id !== routineId
-      ),
-    }));
+  const handleCreateRoutine = () => {
+    const nextRoutineId = `routine-${Date.now()}`;
+    updateWakeRoutineInDraft((routines) => [
+      ...routines,
+      {
+        ...makeDefaultRoutine(nextRoutineId, []),
+        title: `루틴 ${routines.length + 1}`,
+      },
+    ]);
+    setSelectedWakeRoutineId(nextRoutineId);
+    setWakeScreen("edit");
+  };
+
+  const handleDeleteRoutine = (routineId: string) => {
+    updateWakeRoutineInDraft((routines) =>
+      routines.filter((routine) => routine.id !== routineId)
+    );
+    setSelectedWakeRoutineId((prev) => (prev === routineId ? null : prev));
+    setWakeScreen("list");
+  };
+
+  const handleUpdateRoutineTitle = (routineId: string, title: string) => {
+    updateWakeRoutineInDraft((routines) =>
+      routines.map((routine) =>
+        routine.id === routineId
+          ? {
+              ...routine,
+              title,
+            }
+          : routine
+      )
+    );
+  };
+
+  const handleRemoveRoutineTask = (routineId: string, taskId: string) => {
+    updateWakeRoutineInDraft((routines) =>
+      routines.map((routine) =>
+        routine.id === routineId
+          ? {
+              ...routine,
+              tasks: routine.tasks.filter((task) => task.id !== taskId),
+            }
+          : routine
+      )
+    );
+  };
+
+  const handleToggleRoutineTask = (routineId: string, taskId: string) => {
+    updateWakeRoutineInDraft(
+      (routines) =>
+        routines.map((routine) =>
+          routine.id === routineId
+            ? {
+                ...routine,
+                tasks: routine.tasks.map((task) =>
+                  task.id === taskId
+                    ? {
+                        ...task,
+                        completed: !task.completed,
+                      }
+                    : task
+                ),
+              }
+            : routine
+        ),
+      { persist: true }
+    );
+  };
+
+  const handleChangeRoutineTrigger = (
+    routineId: string,
+    triggerType: RoutineTriggerType
+  ) => {
+    updateWakeRoutineInDraft((routines) =>
+      routines.map((routine) =>
+        routine.id === routineId
+          ? {
+              ...routine,
+              triggerType,
+            }
+          : routine
+      )
+    );
+  };
+
+  const handleCompleteWakeRoutine = () => {
+    if (!activeWakeRoutine || !activeWakeRoutineAllDone || activeWakeRoutineCompletedToday) {
+      return;
+    }
+    updateWakeRoutineInDraft(
+      (routines) =>
+        routines.map((routine) => {
+          if (routine.id !== activeWakeRoutine.id) return routine;
+          const lastCompletedDate = routine.lastCompletedDate;
+          const diffDays = lastCompletedDate
+            ? diffDaysBetweenDateKeys(lastCompletedDate, todayKey)
+            : null;
+          const canKeepStreak =
+            diffDays !== null && diffDays > 0 && diffDays - 1 <= ROUTINE_STREAK_GRACE_DAYS;
+          const nextStreak = canKeepStreak ? routine.streak + 1 : 1;
+          const completionHistory = Array.from(
+            new Set([...(routine.completionHistory ?? []), todayKey])
+          ).sort();
+          return {
+            ...routine,
+            streak: nextStreak,
+            totalCompletedDays: routine.totalCompletedDays + 1,
+            lastCompletedDate: todayKey,
+            monthlySuccessRate: calculateMonthlySuccessRate(completionHistory, todayKey),
+            completionHistory,
+          };
+        }),
+      { persist: true }
+    );
   };
 
   const ensureNotificationPermission = async () => {
@@ -2620,49 +2801,32 @@ export default function Home() {
                 <div className="rounded-2xl border border-slate-100 px-3 py-3">
                   <p className="text-[11px] text-slate-400">목표</p>
                   <p className="mt-1 text-sm font-semibold text-slate-900">
-                    {goalsWithProgress.length}개
+                    {goalTracks.length}개
                   </p>
                 </div>
               </div>
 
               <div className="mt-4 space-y-3">
-                {goalsWithProgress.length === 0 && (
+                {goalTracks.length === 0 && (
                   <p className="text-xs text-slate-400">
-                    아직 목표가 없어요. 기록 탭에서 1년 목표를 만들어보세요.
+                    아직 목표가 없어요. 설계 탭에서 목표를 만들어보세요.
                   </p>
                 )}
-                {goalsWithProgress.slice(0, 3).map((goal) => (
+                {goalTracks.slice(0, 3).map((track) => (
                   <div
-                    key={goal.id}
+                    key={track.id}
                     className="rounded-2xl border border-slate-100 px-4 py-3"
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm font-semibold text-slate-900">
-                        {goal.yearGoal}
-                      </p>
-                      <span className="text-xs font-semibold text-slate-600">
-                        {goal.progress}%
-                      </span>
-                    </div>
-                    <p className="mt-1 text-[11px] text-slate-400">
-                      이번 주 행동 단위 {goal.weeklyActionPlan?.todos.length ?? 0}개
+                    <p className="text-sm font-semibold text-slate-900">
+                      {track.title || "제목 없는 목표"}
                     </p>
-                    <div className="mt-2 h-2 w-full rounded-full bg-slate-100">
-                      <div
-                        className="h-2 rounded-full bg-slate-900"
-                        style={{ width: `${goal.progress}%` }}
-                      />
-                    </div>
-                    {goal.progress < 30 &&
-                      (goal.weeklyActionPlan?.todos.length ?? 0) > 0 && (
-                      <button
-                        type="button"
-                        className="mt-2 h-10 w-full rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-600"
-                        onClick={() => setActiveTab("design")}
-                      >
-                        정체기 극복하기 →
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      className="mt-2 h-10 w-full rounded-full border border-slate-200 px-3 text-xs font-semibold text-slate-600"
+                      onClick={() => setActiveTab("design")}
+                    >
+                      설계 보기 →
+                    </button>
                   </div>
                 ))}
               </div>
@@ -2735,184 +2899,264 @@ export default function Home() {
         {activeTab === "wake" && (
           <>
             <section className={uiCard}>
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-semibold">기상 알림 설정</p>
-                  <p className="text-xs text-slate-400">
-                    큰 시간 입력으로 여러 알람을 설정하세요.
-                  </p>
-                </div>
-              </div>
-              <div className={`mt-4 ${uiInputPanel} space-y-3`}>
-                {(settingsDraft.wakeTimes ?? []).length === 0 ? (
-                  <p className="text-xs text-slate-400">
-                    아직 알람이 없어요. 아래에서 추가해 주세요.
-                  </p>
+              <p className="text-sm font-semibold">루틴</p>
+              <p className="text-xs text-slate-400">
+                여러 루틴을 만들고 선택해서 실행하세요.
+              </p>
+            </section>
+
+            {wakeScreen === "list" && (
+              <>
+                {wakeRoutines.length === 0 ? (
+                  <section className={uiCard}>
+                    <p className="text-sm font-semibold">루틴이 없어요</p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      아래 버튼으로 첫 루틴을 만들어 보세요.
+                    </p>
+                  </section>
                 ) : (
-                  (settingsDraft.wakeTimes ?? []).map((alarm) => (
-                    <div key={alarm.id} className="flex items-center gap-3">
-                      <input
-                        type="time"
-                        value={alarm.time}
-                        onChange={(event) =>
-                          handleUpdateWakeTime(alarm.id, event.target.value)
-                        }
-                        className="h-12 w-full rounded-2xl border border-slate-200 px-4 text-lg font-semibold text-slate-900"
-                      />
+                  wakeRoutines.map((routine, index) => (
+                    <section key={routine.id} className={uiCard}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-slate-900">
+                            {getRoutineDisplayTitle(routine.title, index)}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            🔥 {routine.streak}일 · 성공률 {routine.monthlySuccessRate}%
+                          </p>
+                        </div>
+                        <details className="relative">
+                          <summary className="cursor-pointer list-none rounded-full border border-slate-200 px-3 py-1 text-sm text-slate-500">
+                            ⋯
+                          </summary>
+                          <div className="absolute right-0 z-20 mt-2 w-28 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+                            <button
+                              type="button"
+                              className="w-full rounded-xl px-2 py-2 text-left text-xs text-slate-600 hover:bg-slate-50"
+                              onClick={() => {
+                                setSelectedWakeRoutineId(routine.id);
+                                setWakeScreen("edit");
+                              }}
+                            >
+                              편집
+                            </button>
+                            <button
+                              type="button"
+                              className="w-full rounded-xl px-2 py-2 text-left text-xs text-rose-500 hover:bg-rose-50"
+                              onClick={() => handleDeleteRoutine(routine.id)}
+                            >
+                              삭제
+                            </button>
+                          </div>
+                        </details>
+                      </div>
                       <button
                         type="button"
-                        aria-pressed={alarm.enabled}
-                        onClick={() => handleToggleWakeTime(alarm.id)}
-                        className="rounded-full border border-slate-200 px-2 py-2"
+                        className="mt-4 h-11 w-full rounded-full bg-slate-900 px-4 text-xs font-semibold text-white"
+                        onClick={() => {
+                          setSelectedWakeRoutineId(routine.id);
+                          setWakeScreen("execute");
+                        }}
                       >
-                        <span
-                          className={`relative inline-flex h-6 w-10 items-center rounded-full transition ${
-                            alarm.enabled ? "bg-emerald-500" : "bg-slate-300"
-                          }`}
-                        >
-                          <span
-                            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition ${
-                              alarm.enabled ? "translate-x-4" : "translate-x-1"
-                            }`}
-                          />
-                        </span>
+                        실행하기
                       </button>
-                      <button
-                        type="button"
-                        className="rounded-full border border-slate-200 px-2 py-2 text-slate-500"
-                        onClick={() => handleRemoveWakeTime(alarm.id)}
-                        aria-label="알람 삭제"
-                      >
-                        <svg
-                          viewBox="0 0 24 24"
-                          className="h-4 w-4"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.6"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <path d="M4 7h16" />
-                          <path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-                          <path d="M10 11v6" />
-                          <path d="M14 11v6" />
-                          <path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12" />
-                        </svg>
-                      </button>
-                    </div>
+                    </section>
                   ))
                 )}
+                <section className={uiCard}>
+                  <button
+                    type="button"
+                    className={uiPrimaryButton}
+                    onClick={handleCreateRoutine}
+                  >
+                    + 루틴 추가
+                  </button>
+                </section>
+              </>
+            )}
+
+            {wakeScreen === "execute" && activeWakeRoutine && (
+              <section className={uiCard}>
                 <button
                   type="button"
-                  className="h-11 w-full rounded-full border border-dashed border-slate-300 px-4 text-sm font-semibold text-slate-600"
-                  onClick={handleAddWakeTime}
+                  className="text-xs font-semibold text-slate-500"
+                  onClick={() => setWakeScreen("list")}
                 >
-                  + 알람 추가
+                  ← 목록으로
                 </button>
-              </div>
-            {!wakeConsent && (
-              <div className="mt-3 flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs text-slate-500">
-                <span>알림 기능 사용에 동의해 주세요.</span>
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  <div className="rounded-2xl border border-slate-100 px-4 py-3">
+                    <p className="text-[11px] text-slate-400">루틴 이름</p>
+                    <p className="mt-1 text-sm font-semibold text-slate-900">
+                      {getRoutineDisplayTitle(
+                        activeWakeRoutine.title,
+                        activeWakeRoutineIndex >= 0 ? activeWakeRoutineIndex : 0
+                      )}
+                    </p>
+                  </div>
+                  <div className="rounded-2xl border border-slate-100 px-4 py-3">
+                    <p className="text-[11px] text-slate-400">연속 성공일</p>
+                    <p className="mt-1 text-lg font-semibold text-slate-900">
+                      🔥 {activeWakeRoutine.streak}일
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-3 space-y-2">
+                  {activeWakeRoutine.tasks.length === 0 && (
+                    <p className="text-xs text-slate-400">
+                      태스크가 없어요. 편집 화면에서 추가해 주세요.
+                    </p>
+                  )}
+                  {activeWakeRoutine.tasks.map((task) => (
+                    <label
+                      key={task.id}
+                      className={`flex items-center gap-3 rounded-2xl border px-3 py-3 transition ${
+                        task.completed
+                          ? "scale-[1.01] border-emerald-200 bg-emerald-50/70"
+                          : "border-slate-100 bg-white"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={task.completed}
+                        onChange={() => handleToggleRoutineTask(activeWakeRoutine.id, task.id)}
+                        className="h-4 w-4 accent-slate-900"
+                      />
+                      <span
+                        className={`text-sm transition ${
+                          task.completed
+                            ? "font-semibold text-emerald-700 line-through"
+                            : "text-slate-700"
+                        }`}
+                      >
+                        {getIconForRoutine(task.title)} {task.title}
+                      </span>
+                    </label>
+                  ))}
+                </div>
                 <button
-                  className="rounded-full bg-slate-900 px-3 py-1 text-[11px] font-semibold text-white"
-                  onClick={handleConsentWakeNotifications}
-                  disabled={!messagingReady}
+                  type="button"
+                  className={`mt-4 h-11 w-full rounded-full px-4 text-xs font-semibold transition ${
+                    activeWakeRoutineAllDone && !activeWakeRoutineCompletedToday
+                      ? "bg-slate-900 text-white"
+                      : "bg-slate-200 text-slate-400"
+                  }`}
+                  onClick={handleCompleteWakeRoutine}
+                  disabled={!activeWakeRoutineAllDone || activeWakeRoutineCompletedToday}
                 >
-                  알림 사용
+                  {activeWakeRoutineCompletedToday
+                    ? "오늘 루틴 완료됨"
+                    : "오늘 완료하기"}
                 </button>
-              </div>
+              </section>
             )}
-            {firebaseMessagingMissingKeys.length > 0 && (
-              <p className="mt-2 text-xs text-rose-400">
-                {firebaseMessagingMissingKeys.join(", ")} 환경 변수가 필요해요.
-              </p>
-            )}
-            <button
-              className={`mt-4 ${uiPrimaryButton}`}
-              onClick={handleSaveWakeSettings}
-            >
-              설정 저장
-            </button>
-            {wakeSaved && (
-              <p className="mt-2 text-center text-xs text-emerald-600">
-                설정이 저장됐어요.
-              </p>
-            )}
-            {wakeReminder && (
-              <div className="mt-3 rounded-2xl border border-slate-100 bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                <div className="flex items-start justify-between gap-3">
-                  <span>{wakeReminder}</span>
-                  <button
-                    className="text-[11px] text-slate-400"
-                    onClick={() => setWakeReminder(null)}
-                  >
-                    닫기
-                  </button>
-                </div>
-              </div>
-            )}
-          </section>
 
-          <section className={uiCard}>
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-semibold">기상 루틴</p>
-                <p className="text-xs text-slate-400">
-                  알림 후 바로 실천할 일을 적어두세요.
-                </p>
-              </div>
-            </div>
-            <div className={`mt-3 ${uiInputPanel} flex gap-2`}>
-              <input
-                value={newRoutineText}
-                onChange={(event) => setNewRoutineText(event.target.value)}
-                placeholder="예) 물 한 컵 마시기"
-                className="flex-1 rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-              />
-              <button
-                className="h-11 rounded-full bg-slate-900 px-4 text-xs font-semibold text-white"
-                onClick={handleAddRoutine}
-              >
-                추가
-              </button>
-            </div>
-            <div className="mt-3 space-y-2 text-xs">
-              {(settingsDraft.wakeRoutine ?? []).length === 0 && (
-                <p className="text-xs text-slate-400">
-                  등록된 루틴이 없어요.
-                </p>
-              )}
-              {(settingsDraft.wakeRoutine ?? []).map((routine, index) => (
-                <div
-                  key={routine.id}
-                  className="flex items-center justify-between rounded-2xl border border-slate-100 px-3 py-2"
-                >
-                  <span className="text-sm text-slate-700">
-                    {getIconForRoutine(routine.text)} {index + 1}.{" "}
-                    {routine.text}
-                  </span>
+            {wakeScreen === "edit" && activeWakeRoutine && (
+              <>
+                <section className={uiCard}>
                   <button
-                    className="text-xs text-slate-400"
-                    onClick={() => handleRemoveRoutine(routine.id)}
+                    type="button"
+                    className="text-xs font-semibold text-slate-500"
+                    onClick={() => setWakeScreen("list")}
                   >
-                    삭제
+                    ← 목록으로
                   </button>
-                </div>
-              ))}
-            </div>
-            <button
-              className={`mt-4 ${uiPrimaryButton}`}
-              onClick={handleSaveWakeRoutine}
-            >
-              루틴 저장
-            </button>
-            {routineSaved && (
-              <p className="mt-2 text-center text-xs text-emerald-600">
-                루틴이 저장됐어요.
-              </p>
+                  <div className={`mt-3 ${uiInputPanel}`}>
+                    <p className="text-xs font-semibold text-slate-600">루틴 이름</p>
+                    <input
+                      value={activeWakeRoutine.title}
+                      onChange={(event) =>
+                        handleUpdateRoutineTitle(activeWakeRoutine.id, event.target.value)
+                      }
+                      placeholder="루틴 이름"
+                      className="mt-2 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                    />
+                  </div>
+                  <div className={`mt-3 ${uiInputPanel}`}>
+                    <p className="text-xs font-semibold text-slate-600">트리거 방식</p>
+                    <div className="mt-2 grid grid-cols-3 gap-2">
+                      {([
+                        { key: "alarm", label: "알람" },
+                        { key: "manual", label: "수동 시작" },
+                        { key: "location", label: "위치" },
+                      ] as const).map((trigger) => (
+                        <button
+                          key={trigger.key}
+                          type="button"
+                          className={`h-9 rounded-full text-[11px] font-semibold ${
+                            (activeWakeRoutine.triggerType ?? "alarm") === trigger.key
+                              ? "bg-slate-900 text-white"
+                              : "border border-slate-200 bg-white text-slate-600"
+                          }`}
+                          onClick={() =>
+                            handleChangeRoutineTrigger(activeWakeRoutine.id, trigger.key)
+                          }
+                        >
+                          {trigger.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+                <section className={uiCard}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-semibold">루틴 편집</p>
+                      <p className="text-xs text-slate-400">
+                        실행 설정을 수정합니다.
+                      </p>
+                    </div>
+                  </div>
+                  <div className={`mt-3 ${uiInputPanel} flex gap-2`}>
+                    <input
+                      value={newRoutineText}
+                      onChange={(event) => setNewRoutineText(event.target.value)}
+                      placeholder="예) 물 한 컵 마시기"
+                      className="flex-1 rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                    />
+                    <button
+                      className="h-11 rounded-full bg-slate-900 px-4 text-xs font-semibold text-white"
+                      onClick={handleAddRoutine}
+                    >
+                      추가
+                    </button>
+                  </div>
+                  <div className="mt-3 space-y-2 text-xs">
+                    {activeWakeRoutine.tasks.map((task, index) => (
+                      <div
+                        key={task.id}
+                        className="flex items-center justify-between rounded-2xl border border-slate-100 px-3 py-2"
+                      >
+                        <span className="text-sm text-slate-700">
+                          {getIconForRoutine(task.title)} {index + 1}. {task.title}
+                        </span>
+                        <button
+                          className="text-xs text-slate-400"
+                          onClick={() =>
+                            handleRemoveRoutineTask(activeWakeRoutine.id, task.id)
+                          }
+                        >
+                          삭제
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <button
+                    className={`mt-4 ${uiPrimaryButton}`}
+                    onClick={handleSaveWakeRoutine}
+                  >
+                    루틴 저장
+                  </button>
+                  {routineSaved && (
+                    <p className="mt-2 text-center text-xs text-emerald-600">
+                      루틴이 저장됐어요.
+                    </p>
+                  )}
+                </section>
+              </>
             )}
-          </section>
-        </>
+          </>
         )}
 
         {activeTab === "shield" && (
@@ -3101,388 +3345,241 @@ export default function Home() {
             )}
 
             {activeTab === "design" && (
+              <>
               <section className={uiCard}>
-                <p className="text-lg font-semibold">설계</p>
-                <p className="mt-1 text-sm text-slate-500">결과 → 상태 → 행동</p>
-
-                <div className="mt-4 flex items-center justify-end gap-2 text-xs font-semibold">
+                <p className="text-sm font-semibold">설계 / 목표 관리</p>
+                <p className="mt-1 text-xs text-slate-400">
+                  설계(상위)를 만들고 그 아래 목표/주제를 추가하세요.
+                </p>
+                <div className={`mt-3 ${uiInputPanel} flex gap-2`}>
+                  <input
+                    value={newDesignPlanTitle}
+                    onChange={(e) => setNewDesignPlanTitle(e.target.value)}
+                    placeholder="설계 이름 (예: 수능 전체 1등급)"
+                    className="flex-1 rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                  />
                   <button
                     type="button"
-                    className={`${
-                      yearGoals.length > 0
-                        ? "text-slate-600 hover:text-slate-900"
-                        : "text-slate-300"
-                    }`}
-                    onClick={() => setShowGoalPicker((prev) => !prev)}
-                    disabled={yearGoals.length === 0}
+                    className="h-11 rounded-full bg-slate-900 px-4 text-xs font-semibold text-white disabled:bg-slate-300"
+                    onClick={handleAddDesignPlan}
+                    disabled={!newDesignPlanTitle.trim()}
                   >
-                    불러오기
-                  </button>
-                  <span className="text-slate-300">|</span>
-                  <button
-                    type="button"
-                    className="text-slate-600 hover:text-slate-900"
-                    onClick={handleStartNewGoalDraft}
-                  >
-                    새로 작성
+                    추가
                   </button>
                 </div>
-
-                {showGoalPicker && (
-                  <div className="mt-3 space-y-2 rounded-2xl border border-slate-100 bg-slate-50 p-4">
-                    {yearGoals.length === 0 ? (
-                      <p className="text-xs text-slate-400">불러올 목표가 아직 없어요.</p>
-                    ) : (
-                      yearGoals.map((goal) => (
-                        <button
-                          key={goal.id}
-                          type="button"
-                          className={`w-full rounded-full border px-4 py-2 text-left text-sm ${
-                            selectedGoalId === goal.id && !isCreatingNewGoal
-                              ? "border-slate-900 bg-slate-900 text-white"
-                              : "border-slate-200 bg-white text-slate-700"
-                          }`}
-                          onClick={() => {
-                            setIsCreatingNewGoal(false);
-                            setSelectedGoalId(goal.id);
-                            setShowGoalPicker(false);
-                          }}
-                        >
-                          {goal.yearGoal || "제목 없는 목표"}
-                        </button>
-                      ))
-                    )}
-                  </div>
-                )}
-
-                <div className="mt-6 space-y-6">
-                  <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                    <p className="text-sm font-semibold">도착점 설정</p>
-                    <label className="mt-3 block">
-                      <span className="text-xs text-slate-500">원하는 결과</span>
-                      <textarea
-                        value={yearGoalInput}
-                        onChange={(event) => setYearGoalInput(event.target.value)}
-                        rows={3}
-                        className="mt-1 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                        placeholder="예) 9월 모의고사 올 2등급, 체지방 5kg 감량, 포트폴리오 완성 후 지원 완료"
-                      />
-                    </label>
-                  </div>
-
-                  <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                    <p className="text-sm font-semibold">
-                      그 결과가 가능해지려면 나는 어떤 상태여야 할까?
-                    </p>
-                    <p className="mt-1 text-xs text-slate-500">
-                      결과를 직접 적지 말고, 그 결과가 나오기 전의 준비 상태를 적어보세요.
-                    </p>
-                    <label className="mt-3 block">
-                      <span className="text-xs text-slate-500">가능해지는 상태</span>
-                      <textarea
-                        value={currentStatusInput}
-                        onChange={(event) => setCurrentStatusInput(event.target.value)}
-                        rows={4}
-                        className="mt-1 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                        placeholder="예) 기출 2회독 완료, 자주 틀리는 유형 정리, 시간 관리 전략 확립"
-                      />
-                    </label>
-                    <label className="mt-3 block">
-                      <span className="text-xs text-slate-500">현실 조건 (선택)</span>
-                      <textarea
-                        value={positionNoteInput}
-                        onChange={(event) => setPositionNoteInput(event.target.value)}
-                        rows={3}
-                        className="mt-1 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                        placeholder="시간, 환경, 에너지 상태 등"
-                      />
-                    </label>
-                  </div>
-
-                  <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                    <p className="text-sm font-semibold">중간 목표 설정</p>
-                    <label className="mt-3 block">
-                      <span className="text-xs text-slate-500">중간 목표 데드라인</span>
-                      <input
-                        type="date"
-                        value={dailyAvailableTimeInput}
-                        onChange={(event) =>
-                          setDailyAvailableTimeInput(event.target.value)
-                        }
-                        className="mt-1 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-                      />
-                    </label>
-                    <label className="mt-3 block">
-                      <span className="text-xs text-slate-500">중간 목표 상태</span>
-                      <textarea
-                        value={threeMonthGoalInput}
-                        onChange={(event) =>
-                          setThreeMonthGoalInput(event.target.value)
-                        }
-                        rows={3}
-                        className="mt-1 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                        placeholder="데드라인 시점에 도달해 있어야 할 중간 상태를 적어보세요."
-                      />
-                    </label>
-                  </div>
-
-                  <div className="rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                    <p className="text-sm font-semibold">1주 뒤 나는 어떤 상태인가?</p>
-                    <p className="mt-1 text-xs text-slate-500">
-                      중간 목표와 구분해서, 이번 주 끝에서의 상태만 적어보세요.
-                    </p>
-                    <textarea
-                      value={weeklyStateInput}
-                      onChange={(event) => setWeeklyStateInput(event.target.value)}
-                      rows={4}
-                      className="mt-2 w-full rounded-2xl border border-slate-200 p-3 text-sm"
-                      placeholder="예) 이번 주에 완료될 상태를 구체적으로 적어보세요."
-                    />
-                    <button
-                      type="button"
-                      className="mt-3 text-xs font-semibold text-slate-600 hover:text-slate-900"
-                      onClick={() => {
-                        setWeeklyStateInput("");
-                        setWeeklyActionPlan(null);
-                        setWeeklyActionError("");
-                      }}
-                    >
-                      이번 주 상태 재설계
-                    </button>
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  className={`mt-6 h-12 w-full rounded-full px-4 text-xs font-semibold transition-colors ${
-                    goalSaving || !yearGoalInput.trim()
-                      ? "bg-slate-200 text-slate-400"
-                      : "bg-slate-900 text-white hover:bg-slate-800"
-                  }`}
-                  onClick={handleSaveGoalFields}
-                  disabled={goalSaving || !yearGoalInput.trim()}
-                >
-                  {goalSaving ? "저장 중..." : "설계 저장하기 →"}
-                </button>
-
-                <div className="mt-6 rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm font-semibold">실행으로 옮기기</p>
-                    <button
-                      type="button"
-                      className={`rounded-full border px-4 py-2 text-xs font-semibold ${
-                        weeklyActionLoading
-                          ? "border-slate-200 text-slate-400"
-                          : "border-slate-200 text-slate-700"
-                      }`}
-                      onClick={handleGenerateWeeklyActionPlan}
-                      disabled={weeklyActionLoading}
-                    >
-                      {weeklyActionLoading ? "보완 중..." : "AI 보완 도움 받기"}
-                    </button>
-                  </div>
-                  <p className="mt-1 text-xs text-slate-500">
-                    먼저 실행 항목을 직접 작성하고, AI로 표현과 순서를 보완하세요.
-                  </p>
-
-                  {weeklyActionError && (
-                    <p className="mt-2 text-xs text-rose-500">{weeklyActionError}</p>
+                <div className="mt-3 space-y-2">
+                  {designPlans.length === 0 && (
+                    <p className="text-xs text-slate-400">등록된 설계가 없어요.</p>
                   )}
-
-                  <div className="mt-3 space-y-3">
-                    {!weeklyActionPlan && (
-                      <p className="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500">
-                        먼저 아래 버튼으로 실행 항목을 추가해 주세요.
-                      </p>
-                    )}
-                    {weeklyActionPlan && (
-                      <>
-                      <p className="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
-                        💡 {weeklyActionPlan.rationale}
-                      </p>
-                      <div className="space-y-2">
-                        {weeklyActionPlan.todos.map((todo, index) => (
-                          <div key={todo.id} className="flex items-center gap-2">
+                  {designPlans.map((plan) => (
+                    <div
+                      key={plan.id}
+                      className={`rounded-2xl border px-3 py-3 ${
+                        selectedDesignPlanId === plan.id
+                          ? "border-slate-900 bg-slate-50"
+                          : "border-slate-100"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        {editingDesignPlanId === plan.id ? (
+                          <div className="flex flex-1 items-center gap-2">
                             <input
-                              value={todo.text}
-                              onChange={(event) =>
-                                setWeeklyActionPlan((prev) => {
-                                  if (!prev) return prev;
-                                  const nextTodos = [...prev.todos];
-                                  nextTodos[index] = {
-                                    ...nextTodos[index],
-                                    text: event.target.value,
-                                  };
-                                  return { ...prev, todos: nextTodos };
-                                })
-                              }
-                              className="flex-1 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs"
+                              value={editingDesignPlanTitle}
+                              onChange={(e) => setEditingDesignPlanTitle(e.target.value)}
+                              className="flex-1 rounded-xl border border-slate-200 px-2 py-1 text-sm"
+                              placeholder="설계 이름"
+                              autoFocus
                             />
-                            <div className="relative">
-                              <button
-                                type="button"
-                                className="rounded-full border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600"
-                                onClick={() =>
-                                  setWeekdayPickerTodoId((prev) =>
-                                    prev === todo.id ? null : todo.id
-                                  )
-                                }
-                              >
-                                요일
-                              </button>
-                              {weekdayPickerTodoId === todo.id && (
-                                <div className="absolute right-0 z-10 mt-2 w-36 rounded-2xl border border-slate-200 bg-white p-2 shadow-lg">
-                                  <p className="px-1 pb-1 text-[11px] text-slate-500">
-                                    {todo.weekdays.length > 0
-                                      ? `선택됨: ${WEEKDAY_OPTIONS.filter((option) =>
-                                          todo.weekdays.includes(option.value)
-                                        )
-                                          .map((option) => option.label)
-                                          .join(", ")}`
-                                      : "선택된 요일 없음"}
-                                  </p>
-                                  <div className="space-y-1">
-                                    {WEEKDAY_OPTIONS.map((option) => {
-                                      const selected = todo.weekdays.includes(
-                                        option.value
-                                      );
-                                      return (
-                                        <button
-                                          key={option.value}
-                                          type="button"
-                                          className="flex w-full items-center justify-between rounded-xl px-2 py-2 text-xs text-slate-700 hover:bg-slate-50"
-                                          onClick={() =>
-                                            setWeeklyActionPlan((prev) => {
-                                              if (!prev) return prev;
-                                              const nextTodos = [...prev.todos];
-                                              const current =
-                                                nextTodos[index].weekdays;
-                                              const exists = current.includes(
-                                                option.value
-                                              );
-                                              nextTodos[index] = {
-                                                ...nextTodos[index],
-                                                weekdays: exists
-                                                  ? current.filter(
-                                                      (day) =>
-                                                        day !== option.value
-                                                    )
-                                                  : [...current, option.value],
-                                              };
-                                              return { ...prev, todos: nextTodos };
-                                            })
-                                          }
-                                        >
-                                          <span>{option.label}</span>
-                                          <span className="relative flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 bg-white transition-colors duration-200">
-                                            <span
-                                              className={`h-2.5 w-2.5 rounded-full bg-slate-900 transition-all duration-200 ease-out ${
-                                                selected
-                                                  ? "scale-100 opacity-100"
-                                                  : "scale-50 opacity-0"
-                                              }`}
-                                            />
-                                          </span>
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
-                                  <button
-                                    type="button"
-                                    className="mt-2 w-full rounded-full border border-slate-200 px-2 py-1 text-[11px] text-slate-500"
-                                    onClick={() => setWeekdayPickerTodoId(null)}
-                                  >
-                                    확인
-                                  </button>
-                                </div>
-                              )}
-                            </div>
                             <button
                               type="button"
-                              className="rounded-full border border-slate-200 px-3 py-2 text-[11px] text-slate-500"
+                              className="text-xs font-semibold text-slate-600"
                               onClick={() =>
-                                setWeeklyActionPlan((prev) => {
-                                  if (!prev) return prev;
-                                  const nextTodos = prev.todos.filter(
-                                    (_, todoIndex) => todoIndex !== index
-                                  );
-                                  setWeekdayPickerTodoId((currentId) =>
-                                    currentId === todo.id ? null : currentId
-                                  );
-                                  return { ...prev, todos: nextTodos };
-                                })
+                                handleRenameDesignPlan(plan.id, editingDesignPlanTitle)
                               }
+                            >
+                              저장
+                            </button>
+                            <button
+                              type="button"
+                              className="text-xs text-slate-400"
+                              onClick={() => {
+                                setEditingDesignPlanId(null);
+                                setEditingDesignPlanTitle("");
+                              }}
+                            >
+                              취소
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="flex-1 text-left text-sm font-semibold text-slate-900"
+                              onClick={() =>
+                                setSelectedDesignPlanId(
+                                  selectedDesignPlanId === plan.id ? null : plan.id
+                                )
+                              }
+                            >
+                              {plan.title || "제목 없음"}
+                            </button>
+                            <button
+                              type="button"
+                              className="text-xs text-slate-400 hover:text-slate-600"
+                              onClick={() => {
+                                setEditingDesignPlanId(plan.id);
+                                setEditingDesignPlanTitle(plan.title || "");
+                              }}
+                            >
+                              수정
+                            </button>
+                            <button
+                              type="button"
+                              className="text-xs text-slate-400 hover:text-rose-500"
+                              onClick={() => handleDeleteDesignPlan(plan.id)}
                             >
                               삭제
                             </button>
+                          </>
+                        )}
+                      </div>
+                      {selectedDesignPlanId === plan.id && (
+                        <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+                          <div className="flex gap-2">
+                            <input
+                              value={newGoalTrackTitle}
+                              onChange={(e) => setNewGoalTrackTitle(e.target.value)}
+                              placeholder="목표/주제 (예: 수학 1등급)"
+                              className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
+                            />
                             <button
                               type="button"
-                              className={`rounded-full px-3 py-2 text-[11px] font-semibold text-white transition ${
-                                weeklyAddedFeedback[todo.id]
-                                  ? "bg-emerald-600"
-                                  : "bg-slate-900"
-                              }`}
-                              onClick={() => handleAddWeeklyPlannedTodo(todo)}
+                              className="h-9 rounded-full bg-slate-900 px-3 text-xs font-semibold text-white disabled:bg-slate-300"
+                              onClick={handleAddGoalTrack}
+                              disabled={!newGoalTrackTitle.trim()}
                             >
-                              {weeklyAddedFeedback[todo.id] ? "추가됨 ✓" : "투두 추가"}
+                              추가
                             </button>
                           </div>
-                        ))}
-                      </div>
-                      </>
-                    )}
-                    <button
-                      type="button"
-                      className="rounded-full border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600"
-                      onClick={() =>
-                        setWeeklyActionPlan((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                todos: [...prev.todos, makeWeeklyActionTodo("", [])],
-                              }
-                            : {
-                                rationale: "직접 작성한 실행 항목입니다.",
-                                todos: [makeWeeklyActionTodo("", [])],
-                              }
-                        )
-                      }
-                    >
-                      + 투두 한 줄 추가
-                    </button>
-                  </div>
+                          {goalTracks
+                            .filter((t) => t.designPlanId === plan.id)
+                            .map((track) => (
+                              <div
+                                key={track.id}
+                                className="rounded-xl border border-slate-100 px-3 py-2"
+                              >
+                                {editingGoalTrackId === track.id ? (
+                                  <div className="flex items-center gap-2">
+                                    <input
+                                      value={editingGoalTrackTitle}
+                                      onChange={(e) => setEditingGoalTrackTitle(e.target.value)}
+                                      className="flex-1 rounded-lg border border-slate-200 px-2 py-1 text-sm"
+                                      placeholder="목표/주제"
+                                      autoFocus
+                                    />
+                                    <button
+                                      type="button"
+                                      className="text-xs font-semibold text-slate-600"
+                                      onClick={() =>
+                                        handleRenameGoalTrack(track.id, editingGoalTrackTitle)
+                                      }
+                                    >
+                                      저장
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="text-xs text-slate-400"
+                                      onClick={() => {
+                                        setEditingGoalTrackId(null);
+                                        setEditingGoalTrackTitle("");
+                                      }}
+                                    >
+                                      취소
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-sm text-slate-700">
+                                      {track.title || "제목 없음"}
+                                    </span>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        className="text-xs text-slate-400 hover:text-slate-600"
+                                        onClick={() => {
+                                          setEditingGoalTrackId(track.id);
+                                          setEditingGoalTrackTitle(track.title || "");
+                                        }}
+                                      >
+                                        수정
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="text-xs text-slate-400 hover:text-rose-500"
+                                        onClick={() => handleDeleteGoalTrack(track.id)}
+                                      >
+                                        삭제
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
+                                {addingTodoForGoalTrackId === track.id ? (
+                                  <div className="mt-2 flex flex-col gap-2 border-t border-slate-100 pt-2">
+                                    <input
+                                      value={goalTrackTodoText}
+                                      onChange={(e) => setGoalTrackTodoText(e.target.value)}
+                                      placeholder="투두 입력"
+                                      className="rounded-lg border border-slate-200 px-2 py-1 text-sm"
+                                    />
+                                    <input
+                                      type="datetime-local"
+                                      value={goalTrackTodoDueAt}
+                                      onChange={(e) => setGoalTrackTodoDueAt(e.target.value)}
+                                      className="rounded-lg border border-slate-200 px-2 py-1 text-sm"
+                                    />
+                                    <div className="flex gap-2">
+                                      <button
+                                        type="button"
+                                        className="flex-1 rounded-full bg-slate-900 px-2 py-1 text-xs font-semibold text-white disabled:bg-slate-300"
+                                        onClick={handleAddTodoFromGoalTrack}
+                                        disabled={!goalTrackTodoText.trim()}
+                                      >
+                                        추가
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="rounded-full border border-slate-200 px-2 py-1 text-xs text-slate-500"
+                                        onClick={() => {
+                                          setAddingTodoForGoalTrackId(null);
+                                          setGoalTrackTodoText("");
+                                          setGoalTrackTodoDueAt("");
+                                        }}
+                                      >
+                                        취소
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="mt-2 w-full rounded-lg border border-dashed border-slate-200 py-1 text-xs text-slate-500 hover:border-slate-300"
+                                    onClick={() => setAddingTodoForGoalTrackId(track.id)}
+                                  >
+                                    + 투두 추가
+                                  </button>
+                                )}
+                                <ExecutionEvidenceCard track={track} events={goalTrackEvents} />
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
                 </div>
-
-                {goalSaveError && (
-                  <p className="mt-3 text-xs text-rose-500">{goalSaveError}</p>
-                )}
-                <div className="mt-4 rounded-[20px] border border-slate-100 bg-slate-50 p-6">
-                  <p className="text-sm font-semibold">이번 주 상태 달성률</p>
-                  <p className="mt-1 text-xs text-slate-500">
-                    진행률은 감정이 아니라 행동 완료로 자동 계산됩니다.
-                  </p>
-                  <div className="mt-3 h-2 w-full rounded-full bg-white">
-                    <div
-                      className="h-2 rounded-full bg-slate-900 transition-all duration-300"
-                      style={{ width: `${selectedGoalProgress.percent}%` }}
-                    />
-                  </div>
-                  <p className="mt-3 text-sm font-semibold text-slate-700">
-                    {selectedGoalProgress.completed} / {selectedGoalProgress.total} 완료 (
-                    {selectedGoalProgress.percent}%)
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className={`mt-4 w-full ${
-                    selectedGoalId ? uiDangerButton : uiSecondaryButton
-                  }`}
-                  onClick={handleDeleteYearGoal}
-                  disabled={!selectedGoalId}
-                >
-                  목표 삭제
-                </button>
               </section>
+
+
+              </>
             )}
 
             {activeTab === "log" && logSection === "record" && (
@@ -3500,14 +3597,14 @@ export default function Home() {
                     placeholder="예) 핵심 자료 1개 저장"
                   />
                   <select
-                    value={recordGoalId}
-                    onChange={(event) => setRecordGoalId(event.target.value)}
+                    value={recordGoalTrackId}
+                    onChange={(event) => setRecordGoalTrackId(event.target.value)}
                     className="w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
                   >
                     <option value="">목표 선택(선택 안 함)</option>
-                    {yearGoals.map((goal) => (
-                      <option key={goal.id} value={goal.id}>
-                        {goal.yearGoal || "제목 없는 목표"}
+                    {goalTracks.map((track) => (
+                      <option key={track.id} value={track.id}>
+                        {track.title || "제목 없는 목표"}
                       </option>
                     ))}
                   </select>
@@ -3531,8 +3628,9 @@ export default function Home() {
                     </p>
                   )}
                   {recordsThisMonth.slice(0, 8).map((record) => {
-                    const linkedGoal = yearGoals.find(
-                      (goal) => goal.id === record.goalId
+                    const goalId = record.goalTrackId ?? record.goalId;
+                    const linkedTrack = goalTracks.find(
+                      (t) => t.id === goalId
                     );
                     return (
                       <div
@@ -3541,7 +3639,7 @@ export default function Home() {
                       >
                         <p className="text-sm text-slate-800">{record.content}</p>
                         <p className="mt-1 text-[11px] text-slate-400">
-                          {linkedGoal ? linkedGoal.yearGoal : "목표 미선택"} ·{" "}
+                          {linkedTrack ? linkedTrack.title : "목표 미선택"} ·{" "}
                           {record.createdAt.toLocaleString()}
                         </p>
                       </div>
@@ -3649,30 +3747,53 @@ export default function Home() {
                   onChange={(event) => {
                     const checked = event.target.checked;
                     setLinkNewTodoToGoal(checked);
-                    if (!checked) setNewTodoGoalId("");
+                    if (!checked) {
+                      setNewTodoDesignPlanId("");
+                      setNewTodoGoalTrackId("");
+                    }
                   }}
                   className="h-4 w-4"
                 />
                 이 투두를 목표에 연결하기
               </label>
               {linkNewTodoToGoal && (
-                <select
-                  value={newTodoGoalId}
-                  onChange={(event) => setNewTodoGoalId(event.target.value)}
-                  className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
-                >
-                  <option value="">목표 선택</option>
-                  {yearGoals.map((goal) => (
-                    <option key={goal.id} value={goal.id}>
-                      {goal.yearGoal || "제목 없는 목표"}
-                    </option>
-                  ))}
-                </select>
+                <div className="flex flex-col gap-2">
+                  <select
+                    value={newTodoDesignPlanId}
+                    onChange={(event) => {
+                      setNewTodoDesignPlanId(event.target.value);
+                      setNewTodoGoalTrackId("");
+                    }}
+                    className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                  >
+                    <option value="">설계 선택</option>
+                    {designPlans.map((plan) => (
+                      <option key={plan.id} value={plan.id}>
+                        {plan.title || "제목 없음"}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={newTodoGoalTrackId}
+                    onChange={(event) => setNewTodoGoalTrackId(event.target.value)}
+                    className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
+                    disabled={!newTodoDesignPlanId}
+                  >
+                    <option value="">목표/주제 선택</option>
+                    {goalTracks
+                      .filter((t) => t.designPlanId === newTodoDesignPlanId)
+                      .map((track) => (
+                        <option key={track.id} value={track.id}>
+                          {track.title || "제목 없음"}
+                        </option>
+                      ))}
+                  </select>
+                </div>
               )}
               <button
                 className={uiPrimaryButton}
                 onClick={handleAddTodo}
-                disabled={linkNewTodoToGoal && !newTodoGoalId}
+                disabled={linkNewTodoToGoal && !newTodoGoalTrackId}
               >
                 추가
               </button>
@@ -3737,6 +3858,13 @@ export default function Home() {
                           삭제
                         </button>
                       </div>
+                      {getTodoGoalTrackId(todo) && (
+                        <p className="mt-1 text-[11px] text-slate-400">
+                          →{" "}
+                          {goalTracks.find((t) => t.id === getTodoGoalTrackId(todo))?.title ??
+                            "목표"}
+                        </p>
+                      )}
                       {dueAtMillis !== null && (
                         <p
                           className={`mt-1 text-[11px] ${
@@ -3889,7 +4017,7 @@ export default function Home() {
         >
           {[
             { key: "home", label: "홈" },
-            { key: "wake", label: "기상" },
+            { key: "wake", label: "루틴" },
             { key: "shield", label: "보호" },
             { key: "log", label: "기록" },
             { key: "design", label: "설계" },
