@@ -1982,6 +1982,27 @@ export default function Home() {
     setEditingGoalLinkTodoId(null);
   };
 
+  const handleCreateTodoFromReview = async (goalTrackId: string, text: string) => {
+    if (!user || !db || !text.trim()) return;
+    const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
+    const normalizedText = text.trim();
+    const duplicateSnapshot = await getDocs(
+      query(todosRef, where("text", "==", normalizedText), limit(1))
+    );
+    if (!duplicateSnapshot.empty) return;
+    await addDoc(todosRef, {
+      text: normalizedText,
+      done: false,
+      effects: [],
+      completedAt: null,
+      dueAt: null,
+      goalTrackId,
+      createdAt: serverTimestamp(),
+    });
+    setExecutionToast("투두에 추가했어요");
+    window.setTimeout(() => setExecutionToast(null), 2000);
+  };
+
   const handleSaveWeeklyReview = async (data: {
     goalTrackId: string;
     weekStartKey: string;
@@ -1993,12 +2014,36 @@ export default function Home() {
     if (!user || !db) return;
     setWeeklyReviewSaving(true);
     try {
-      const { coachSummary, coachQuestion } = generateCoachResponse({
-        rhythm: data.rhythm,
-        wobbleMoment: data.wobbleMoment,
-        nextWeekOneChange: data.nextWeekOneChange,
-        nextWeekKeepOne: data.nextWeekKeepOne,
-      });
+      let coachSummary: string;
+      let coachQuestion: string;
+      try {
+        const res = await fetch("/api/ai/weekly-review-coach", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            rhythm: data.rhythm,
+            wobbleMoment: data.wobbleMoment,
+            nextWeekOneChange: data.nextWeekOneChange,
+            nextWeekKeepOne: data.nextWeekKeepOne,
+          }),
+        });
+        const json = (await res.json()) as { result?: { coachSummary?: string; coachQuestion?: string } };
+        if (json.result?.coachSummary && json.result?.coachQuestion) {
+          coachSummary = json.result.coachSummary;
+          coachQuestion = json.result.coachQuestion;
+        } else {
+          throw new Error("AI fallback");
+        }
+      } catch {
+        const fallback = generateCoachResponse({
+          rhythm: data.rhythm,
+          wobbleMoment: data.wobbleMoment,
+          nextWeekOneChange: data.nextWeekOneChange,
+          nextWeekKeepOne: data.nextWeekKeepOne,
+        });
+        coachSummary = fallback.coachSummary;
+        coachQuestion = fallback.coachQuestion;
+      }
       const reviewId = buildReviewId(data.goalTrackId, data.weekStartKey);
       const reviewRef = doc(
         db,
@@ -3746,6 +3791,7 @@ export default function Home() {
                                   }
                                   weekStartKey={getWeekStartKeyKST()}
                                   last7DaysCounts={calcLast7Days(goalTrackEvents, track.id)}
+                                  onAddTodo={handleCreateTodoFromReview}
                                   onSave={handleSaveWeeklyReview}
                                   saving={weeklyReviewSaving}
                                 />

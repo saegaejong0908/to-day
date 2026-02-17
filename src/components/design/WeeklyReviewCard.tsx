@@ -16,6 +16,7 @@ type Props = {
   review: GoalTrackWeeklyReview | null;
   weekStartKey: string;
   last7DaysCounts?: Record<string, number>;
+  onAddTodo?: (goalTrackId: string, text: string) => void;
   onSave: (data: {
     goalTrackId: string;
     weekStartKey: string;
@@ -32,6 +33,7 @@ export function WeeklyReviewCard({
   review,
   weekStartKey,
   last7DaysCounts,
+  onAddTodo,
   onSave,
   saving = false,
 }: Props) {
@@ -151,13 +153,24 @@ export function WeeklyReviewCard({
             {review.coachQuestion}
           </p>
         </div>
-        <button
-          type="button"
-          className="mt-2 text-[11px] text-slate-500 underline-offset-1 hover:underline"
-          onClick={handleStartEdit}
-        >
-          수정
-        </button>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {review.nextWeekOneChange && onAddTodo && (
+            <button
+              type="button"
+              className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] text-slate-600 hover:bg-slate-50"
+              onClick={() => onAddTodo(track.id, review.nextWeekOneChange)}
+            >
+              이 행동을 투두로 추가
+            </button>
+          )}
+          <button
+            type="button"
+            className="text-[11px] text-slate-500 underline-offset-1 hover:underline"
+            onClick={handleStartEdit}
+          >
+            수정
+          </button>
+        </div>
       </div>
     );
   }
