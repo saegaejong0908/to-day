@@ -30,7 +30,11 @@ export function buildWeeklyCoach(
   counts: Record<string, number>,
   review: Pick<
     GoalTrackWeeklyReview,
-    "rhythm" | "wobbleMoment" | "nextWeekOneChange" | "nextWeekKeepOne"
+    | "rhythm"
+    | "wobbleMoment"
+    | "nextWeekOneChange"
+    | "nextWeekRuleText"
+    | "nextWeekKeepOne"
   >
 ): WeeklyCoachResult {
   const keys = getLastNDateKeys(7);
@@ -63,7 +67,8 @@ export function buildWeeklyCoach(
     }
   }
 
-  let action = review.nextWeekOneChange?.trim() || "";
+  let action =
+    review.nextWeekRuleText?.trim() || review.nextWeekOneChange?.trim() || "";
   if (action) {
     action = sanitizeActionText(action);
   }

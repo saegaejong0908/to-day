@@ -50,12 +50,18 @@ import {
   initialEffectState,
 } from "@/store/effectReducer";
 import { MissedReasonType } from "@/types/missed-reason";
+import { STRATEGY_OPTIONS, type StrategyType } from "@/types/strategyType";
 import type { RecordItem } from "@/types/record";
 import type { DesignPlan } from "@/types/designPlan";
 import type { GoalTrack } from "@/types/goalTrack";
 import type { GoalTrackEvent } from "@/types/goalTrackEvent";
 import type { GoalTrackWeeklyReview } from "@/types/goalTrackWeeklyReview";
-import { buildEventId, calcLast7Days } from "@/domain/execution";
+import {
+  buildEventId,
+  calcLast7Days,
+  getExecutedDayCount,
+  recentEvents,
+} from "@/domain/execution";
 import { buildReviewId } from "@/domain/weeklyReview";
 import { buildWeeklyCoach } from "@/domain/weeklyCoach";
 import {
@@ -1210,19 +1216,58 @@ export default function Home() {
           }
           return v instanceof Date ? v : new Date();
         };
+        const rhythm =
+          data.rhythm === "steady" || data.rhythm === "sporadic" || data.rhythm === "stopped"
+            ? data.rhythm
+            : "steady";
+        const status =
+          data.status === "STEADY" || data.status === "SPORADIC" || data.status === "STOPPED"
+            ? data.status
+            : rhythm === "steady"
+              ? "STEADY"
+              : rhythm === "sporadic"
+                ? "SPORADIC"
+                : "STOPPED";
+        const nextWeekRuleText =
+          typeof data.nextWeekRuleText === "string"
+            ? data.nextWeekRuleText
+            : typeof data.nextWeekOneChange === "string"
+              ? data.nextWeekOneChange
+              : "";
+        const plannedWeekdays = Array.isArray(data.plannedWeekdays)
+          ? (data.plannedWeekdays as number[]).filter(
+              (n) => typeof n === "number" && n >= 0 && n <= 6
+            )
+          : undefined;
+        const blockReason =
+          typeof data.blockReason === "string" &&
+          Object.values(MissedReasonType).includes(data.blockReason as MissedReasonType)
+            ? (data.blockReason as MissedReasonType)
+            : undefined;
         return {
           id: item.id,
           goalTrackId: typeof data.goalTrackId === "string" ? data.goalTrackId : "",
           weekStartKey: typeof data.weekStartKey === "string" ? data.weekStartKey : "",
-          rhythm:
-            data.rhythm === "steady" || data.rhythm === "sporadic" || data.rhythm === "stopped"
-              ? data.rhythm
-              : "steady",
-          wobbleMoment: typeof data.wobbleMoment === "string" ? data.wobbleMoment : "",
+          rhythm,
+          status,
+          wobbleMoment: typeof data.wobbleMoment === "string" ? data.wobbleMoment : undefined,
+          blockReason: blockReason ?? null,
+          blockNote: typeof data.blockNote === "string" ? data.blockNote : undefined,
           nextWeekOneChange:
-            typeof data.nextWeekOneChange === "string" ? data.nextWeekOneChange : "",
+            typeof data.nextWeekOneChange === "string" ? data.nextWeekOneChange : undefined,
+          nextWeekRuleText: nextWeekRuleText || undefined,
           nextWeekKeepOne:
             typeof data.nextWeekKeepOne === "string" ? data.nextWeekKeepOne : undefined,
+          plannedWeekdays,
+          selectedStrategies: Array.isArray(data.selectedStrategies)
+            ? (data.selectedStrategies as string[]).filter((s): s is StrategyType =>
+                STRATEGY_OPTIONS.includes(s as StrategyType)
+              )
+            : undefined,
+          aiRefinedRuleText:
+            typeof data.aiRefinedRuleText === "string" ? data.aiRefinedRuleText : undefined,
+          aiRefineRationale:
+            typeof data.aiRefineRationale === "string" ? data.aiRefineRationale : undefined,
           coachFact: typeof data.coachFact === "string" ? data.coachFact : undefined,
           coachPattern: typeof data.coachPattern === "string" ? data.coachPattern : undefined,
           coachAction: typeof data.coachAction === "string" ? data.coachAction : undefined,
@@ -2052,20 +2097,29 @@ export default function Home() {
   const handleSaveWeeklyReview = async (data: {
     goalTrackId: string;
     weekStartKey: string;
-    rhythm: "steady" | "sporadic" | "stopped";
-    wobbleMoment: string;
-    nextWeekOneChange: string;
-    nextWeekKeepOne?: string;
+    status: "STEADY" | "SPORADIC" | "STOPPED";
+    blockReason?: MissedReasonType | null;
+    blockNote?: string;
+    nextWeekRuleText: string;
+    plannedWeekdays?: number[];
+    selectedStrategies?: StrategyType[];
+    aiRefinedRuleText?: string;
+    aiRefineRationale?: string;
   }) => {
     if (!user || !db) return;
     setWeeklyReviewSaving(true);
     try {
       const counts = calcLast7Days(goalTrackEvents, data.goalTrackId);
+      const rhythm =
+        data.status === "STEADY"
+          ? "steady"
+          : data.status === "SPORADIC"
+            ? "sporadic"
+            : "stopped";
       const coach = buildWeeklyCoach(counts, {
-        rhythm: data.rhythm,
-        wobbleMoment: data.wobbleMoment,
-        nextWeekOneChange: data.nextWeekOneChange,
-        nextWeekKeepOne: data.nextWeekKeepOne,
+        rhythm,
+        wobbleMoment: "",
+        nextWeekRuleText: data.nextWeekRuleText,
       });
       const reviewId = buildReviewId(data.goalTrackId, data.weekStartKey);
       const reviewRef = doc(
@@ -2081,10 +2135,16 @@ export default function Home() {
         {
           goalTrackId: data.goalTrackId,
           weekStartKey: data.weekStartKey,
-          rhythm: data.rhythm,
-          wobbleMoment: data.wobbleMoment,
-          nextWeekOneChange: data.nextWeekOneChange,
-          nextWeekKeepOne: data.nextWeekKeepOne ?? null,
+          rhythm,
+          status: data.status,
+          blockReason: data.blockReason ?? null,
+          blockNote: data.blockNote ?? null,
+          nextWeekRuleText: data.nextWeekRuleText,
+          nextWeekOneChange: data.nextWeekRuleText,
+          plannedWeekdays: data.plannedWeekdays ?? null,
+          selectedStrategies: data.selectedStrategies ?? null,
+          aiRefinedRuleText: data.aiRefinedRuleText ?? null,
+          aiRefineRationale: data.aiRefineRationale ?? null,
           coachFact: coach.fact,
           coachPattern: coach.pattern,
           coachAction: coach.action,
@@ -3883,6 +3943,27 @@ export default function Home() {
                                   }
                                   weekStartKey={getWeekStartKeyKST()}
                                   last7DaysCounts={calcLast7Days(goalTrackEvents, track.id)}
+                                  recentExecution={(() => {
+                                    const counts = calcLast7Days(
+                                      goalTrackEvents,
+                                      track.id
+                                    );
+                                    const keys = getLastNDateKeys(7);
+                                    const executedDays = getExecutedDayCount(
+                                      counts,
+                                      keys
+                                    );
+                                    const recent = recentEvents(
+                                      goalTrackEvents,
+                                      track.id,
+                                      1
+                                    );
+                                    return {
+                                      executedDays,
+                                      lastExecutedText:
+                                        recent[0]?.todoText ?? "",
+                                    };
+                                  })()}
                                   editingReviewDayGoalTrackId={
                                     editingReviewDayGoalTrackId
                                   }
