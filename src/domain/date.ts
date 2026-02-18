@@ -62,6 +62,25 @@ export const getWeekStartKeysForLastNWeeks = (n: number): string[] => {
   return keys;
 };
 
+/** dateKey에 N일 더하기 (YYYY-MM-DD) */
+export const addDaysToDateKey = (dateKey: string, days: number): string => {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  date.setDate(date.getDate() + days);
+  const pad = (v: number) => String(v).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+};
+
+/** 다음 주 특정 요일의 dateKey (KST). weekday: 0=월 … 6=일 */
+export const getNextWeekDateKeyByWeekdayKST = (
+  weekday: number,
+  from: Date = new Date()
+): string => {
+  const thisWeekMonday = getWeekStartKeyKST(from);
+  const nextWeekMonday = addDaysToDateKey(thisWeekMonday, 7);
+  return addDaysToDateKey(nextWeekMonday, weekday);
+};
+
 /** dateKey 문자열 비교 (a < b) */
 export const isDateKeyBefore = (a: string, b: string): boolean => a < b;
 

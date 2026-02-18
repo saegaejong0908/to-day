@@ -57,9 +57,10 @@ import type { GoalTrackEvent } from "@/types/goalTrackEvent";
 import type { GoalTrackWeeklyReview } from "@/types/goalTrackWeeklyReview";
 import { buildEventId, calcLast7Days } from "@/domain/execution";
 import { buildReviewId } from "@/domain/weeklyReview";
-import { generateCoachResponse } from "@/domain/weeklyReview";
+import { buildWeeklyCoach } from "@/domain/weeklyCoach";
 import {
   getLastNDateKeys,
+  getNextWeekDateKeyByWeekdayKST,
   getWeekStartKeyKST,
   getWeekStartKeysForLastNWeeks,
 } from "@/domain/date";
@@ -673,6 +674,9 @@ export default function Home() {
   const [selectedDesignPlanId, setSelectedDesignPlanId] = useState<string | null>(null);
   const [newDesignPlanTitle, setNewDesignPlanTitle] = useState("");
   const [newGoalTrackTitle, setNewGoalTrackTitle] = useState("");
+  const [editingReviewDayGoalTrackId, setEditingReviewDayGoalTrackId] = useState<
+    string | null
+  >(null);
   const [editingDesignPlanId, setEditingDesignPlanId] = useState<string | null>(null);
   const [editingDesignPlanTitle, setEditingDesignPlanTitle] = useState("");
   const [editingGoalTrackId, setEditingGoalTrackId] = useState<string | null>(null);
@@ -1146,10 +1150,13 @@ export default function Home() {
     const unsubscribeGoalTracks = onSnapshot(goalTracksQuery, (snapshot) => {
       const next: GoalTrack[] = snapshot.docs.map((item) => {
         const data = item.data();
+        const rw = data.reviewWeekday;
         return {
           id: item.id,
           designPlanId: typeof data.designPlanId === "string" ? data.designPlanId : "",
           title: typeof data.title === "string" ? data.title : "",
+          reviewWeekday:
+            typeof rw === "number" && rw >= 0 && rw <= 6 ? rw : 6,
           createdAt: toCreatedAtString(data.createdAt) || "",
         };
       });
@@ -1216,8 +1223,11 @@ export default function Home() {
             typeof data.nextWeekOneChange === "string" ? data.nextWeekOneChange : "",
           nextWeekKeepOne:
             typeof data.nextWeekKeepOne === "string" ? data.nextWeekKeepOne : undefined,
-          coachSummary: typeof data.coachSummary === "string" ? data.coachSummary : "",
-          coachQuestion: typeof data.coachQuestion === "string" ? data.coachQuestion : "",
+          coachFact: typeof data.coachFact === "string" ? data.coachFact : undefined,
+          coachPattern: typeof data.coachPattern === "string" ? data.coachPattern : undefined,
+          coachAction: typeof data.coachAction === "string" ? data.coachAction : undefined,
+          coachSummary: typeof data.coachSummary === "string" ? data.coachSummary : undefined,
+          coachQuestion: typeof data.coachQuestion === "string" ? data.coachQuestion : undefined,
           createdAt: toDate(data.createdAt),
           updatedAt: toDate(data.updatedAt),
         };
@@ -1782,6 +1792,7 @@ export default function Home() {
     await addDoc(ref, {
       designPlanId: selectedDesignPlanId,
       title: newGoalTrackTitle.trim(),
+      reviewWeekday: 6,
       createdAt: serverTimestamp(),
     });
     setNewGoalTrackTitle("");
@@ -1793,6 +1804,16 @@ export default function Home() {
     await updateDoc(trackRef, { title: title.trim() });
     setEditingGoalTrackId(null);
     setEditingGoalTrackTitle("");
+  };
+
+  const handleUpdateGoalTrackReviewWeekday = async (
+    goalTrackId: string,
+    reviewWeekday: number
+  ) => {
+    if (!user || !db) return;
+    const trackRef = doc(db, "users", user.uid, "goalTracks", goalTrackId);
+    await updateDoc(trackRef, { reviewWeekday });
+    setEditingReviewDayGoalTrackId(null);
   };
 
   const handleAddTodoFromGoalTrack = async () => {
@@ -1995,14 +2016,26 @@ export default function Home() {
     setEditingGoalLinkTodoId(null);
   };
 
-  const handleCreateTodoFromReview = async (goalTrackId: string, text: string) => {
-    if (!user || !db || !text.trim()) return;
-    const todosRef = collection(db, "users", user.uid, "days", todayKey, "todos");
-    const normalizedText = text.trim();
+  const handleApplyWeeklyCoachAction = async (
+    goalTrackId: string,
+    actionText: string,
+    weekday: number
+  ) => {
+    if (!user || !db || !actionText.trim()) return;
+    const normalizedText = actionText.trim();
+    const targetDateKey = getNextWeekDateKeyByWeekdayKST(weekday);
+    const todosRef = collection(db, "users", user.uid, "days", targetDateKey, "todos");
     const duplicateSnapshot = await getDocs(
-      query(todosRef, where("text", "==", normalizedText), limit(1))
+      query(todosRef, where("goalTrackId", "==", goalTrackId), limit(50))
     );
-    if (!duplicateSnapshot.empty) return;
+    const isDuplicate = duplicateSnapshot.docs.some(
+      (d) => (d.data().text as string)?.trim() === normalizedText
+    );
+    if (isDuplicate) {
+      setExecutionToast("이미 추가되어 있어요");
+      window.setTimeout(() => setExecutionToast(null), 2000);
+      return;
+    }
     await addDoc(todosRef, {
       text: normalizedText,
       done: false,
@@ -2012,7 +2045,7 @@ export default function Home() {
       goalTrackId,
       createdAt: serverTimestamp(),
     });
-    setExecutionToast("투두에 추가했어요");
+    setExecutionToast("다음 주 투두에 추가했어요");
     window.setTimeout(() => setExecutionToast(null), 2000);
   };
 
@@ -2027,36 +2060,13 @@ export default function Home() {
     if (!user || !db) return;
     setWeeklyReviewSaving(true);
     try {
-      let coachSummary: string;
-      let coachQuestion: string;
-      try {
-        const res = await fetch("/api/ai/weekly-review-coach", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            rhythm: data.rhythm,
-            wobbleMoment: data.wobbleMoment,
-            nextWeekOneChange: data.nextWeekOneChange,
-            nextWeekKeepOne: data.nextWeekKeepOne,
-          }),
-        });
-        const json = (await res.json()) as { result?: { coachSummary?: string; coachQuestion?: string } };
-        if (json.result?.coachSummary && json.result?.coachQuestion) {
-          coachSummary = json.result.coachSummary;
-          coachQuestion = json.result.coachQuestion;
-        } else {
-          throw new Error("AI fallback");
-        }
-      } catch {
-        const fallback = generateCoachResponse({
-          rhythm: data.rhythm,
-          wobbleMoment: data.wobbleMoment,
-          nextWeekOneChange: data.nextWeekOneChange,
-          nextWeekKeepOne: data.nextWeekKeepOne,
-        });
-        coachSummary = fallback.coachSummary;
-        coachQuestion = fallback.coachQuestion;
-      }
+      const counts = calcLast7Days(goalTrackEvents, data.goalTrackId);
+      const coach = buildWeeklyCoach(counts, {
+        rhythm: data.rhythm,
+        wobbleMoment: data.wobbleMoment,
+        nextWeekOneChange: data.nextWeekOneChange,
+        nextWeekKeepOne: data.nextWeekKeepOne,
+      });
       const reviewId = buildReviewId(data.goalTrackId, data.weekStartKey);
       const reviewRef = doc(
         db,
@@ -2075,8 +2085,9 @@ export default function Home() {
           wobbleMoment: data.wobbleMoment,
           nextWeekOneChange: data.nextWeekOneChange,
           nextWeekKeepOne: data.nextWeekKeepOne ?? null,
-          coachSummary,
-          coachQuestion,
+          coachFact: coach.fact,
+          coachPattern: coach.pattern,
+          coachAction: coach.action,
           updatedAt: serverTimestamp(),
           ...(existing ? {} : { createdAt: serverTimestamp() }),
         },
@@ -3758,7 +3769,7 @@ export default function Home() {
                             .map((track) => (
                               <div
                                 key={track.id}
-                                className="rounded-xl border border-slate-100 px-3 py-2"
+                                className="mb-5 rounded-[14px] border border-black/[0.08] bg-white px-5 py-5 transition-colors hover:border-black/20"
                               >
                                 {editingGoalTrackId === track.id ? (
                                   <div className="flex items-center gap-2">
@@ -3872,7 +3883,16 @@ export default function Home() {
                                   }
                                   weekStartKey={getWeekStartKeyKST()}
                                   last7DaysCounts={calcLast7Days(goalTrackEvents, track.id)}
-                                  onAddTodo={handleCreateTodoFromReview}
+                                  editingReviewDayGoalTrackId={
+                                    editingReviewDayGoalTrackId
+                                  }
+                                  onUpdateReviewWeekday={
+                                    handleUpdateGoalTrackReviewWeekday
+                                  }
+                                  onEditingReviewDayChange={
+                                    setEditingReviewDayGoalTrackId
+                                  }
+                                  onApplyAction={handleApplyWeeklyCoachAction}
                                   onSave={handleSaveWeeklyReview}
                                   saving={weeklyReviewSaving}
                                 />
