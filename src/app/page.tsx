@@ -58,8 +58,13 @@ import type { GoalTrackWeeklyReview } from "@/types/goalTrackWeeklyReview";
 import { buildEventId, calcLast7Days } from "@/domain/execution";
 import { buildReviewId } from "@/domain/weeklyReview";
 import { generateCoachResponse } from "@/domain/weeklyReview";
-import { getWeekStartKeyKST } from "@/domain/date";
-import { getWeekStartKeysForLastNWeeks } from "@/domain/date";
+import {
+  getLastNDateKeys,
+  getWeekStartKeyKST,
+  getWeekStartKeysForLastNWeeks,
+} from "@/domain/date";
+import { calcRhythmImpact, fallbackSuggestion } from "@/domain/todoBlock";
+import type { BlockType } from "@/types/todoBlock";
 import {
   deleteGoalTrackEventsByGoalTrackId,
   deleteGoalTrackEventsByTodoId,
@@ -67,6 +72,7 @@ import {
 import { ExecutionEvidenceCard } from "@/components/design/ExecutionEvidenceCard";
 import { WeeklyReviewCard } from "@/components/design/WeeklyReviewCard";
 import { InlineGoalLinkEditor } from "@/components/todo/InlineGoalLinkEditor";
+import { TodoBlockPanel } from "@/components/todo/TodoBlockPanel";
 
 const USER_TYPES = ["neutral"] as const;
 type UserType = (typeof USER_TYPES)[number];
@@ -681,6 +687,13 @@ export default function Home() {
   const [weeklyReviewSaving, setWeeklyReviewSaving] = useState(false);
   const [executionToast, setExecutionToast] = useState<string | null>(null);
   const [editingGoalLinkTodoId, setEditingGoalLinkTodoId] = useState<string | null>(null);
+  const [openBlockPanelTodoId, setOpenBlockPanelTodoId] = useState<string | null>(null);
+  const [blockSuggestion, setBlockSuggestion] = useState<
+    Record<string, { question: string; rewrittenTodo: string }>
+  >({});
+  const [blockSuggestionLoading, setBlockSuggestionLoading] = useState<
+    Record<string, boolean>
+  >({});
   const [todayKey, setTodayKey] = useState(getLocalDateKey());
   const [yesterdayKey, setYesterdayKey] = useState(getYesterdayKey());
   const [currentMonth, setCurrentMonth] = useState(new Date());
@@ -2244,6 +2257,74 @@ export default function Home() {
 
   const handleKeepTodo = (todoId: string) => {
     clearTodoAIResult(todoId);
+  };
+
+  const handleOpenBlockPanel = (todoId: string) => {
+    setOpenBlockPanelTodoId((prev) => (prev === todoId ? null : todoId));
+    setEditingGoalLinkTodoId(null);
+  };
+
+  const handleFetchTodoBlockSuggestion = async (
+    todo: TodoItem,
+    blockType: BlockType,
+    situation?: string
+  ) => {
+    setBlockSuggestionLoading((prev) => ({ ...prev, [todo.id]: true }));
+    setBlockSuggestion((prev) => {
+      const next = { ...prev };
+      delete next[todo.id];
+      return next;
+    });
+    let result: { question: string; rewrittenTodo: string } | null = null;
+    try {
+      const response = await fetch("/api/ai/todo-block", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          blockType,
+          originalTodo: todo.text,
+          situation: situation || undefined,
+        }),
+      });
+      if (response.ok) {
+        const data = (await response.json()) as {
+          result?: { question: string; rewrittenTodo: string } | null;
+        };
+        result = data.result ?? null;
+      }
+    } catch {
+      // fall through to fallback
+    }
+    if (!result || !result.question || !result.rewrittenTodo) {
+      result = fallbackSuggestion(blockType, todo.text);
+    }
+    setBlockSuggestion((prev) => ({ ...prev, [todo.id]: result! }));
+    setBlockSuggestionLoading((prev) => ({ ...prev, [todo.id]: false }));
+  };
+
+  const handleApplyTodoBlockSuggestion = async (
+    todo: TodoItem,
+    newText: string
+  ) => {
+    if (!user || !db || !newText.trim()) return;
+    const todoRef = doc(
+      db,
+      "users",
+      user.uid,
+      "days",
+      todayKey,
+      "todos",
+      todo.id
+    );
+    await updateDoc(todoRef, { text: newText.trim() });
+    setBlockSuggestion((prev) => {
+      const next = { ...prev };
+      delete next[todo.id];
+      return next;
+    });
+    setOpenBlockPanelTodoId(null);
+    setExecutionToast("투두 문구를 조정했어요");
+    window.setTimeout(() => setExecutionToast(null), 2000);
   };
 
   const handleConfirmCompletedButNotChecked = async (todo: TodoItem) => {
@@ -4103,10 +4184,23 @@ export default function Home() {
                           onClick={(e) => {
                             e.preventDefault();
                             setEditingGoalLinkTodoId(isEditingGoalLink ? null : todo.id);
+                            setOpenBlockPanelTodoId(null);
                           }}
                         >
                           {linkedGoalTrackId ? "변경" : "목표 연결"}
                         </button>
+                        {linkedGoalTrackId && !todo.done && (
+                          <button
+                            type="button"
+                            className="text-[11px] text-slate-500 underline-offset-1 hover:underline"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              handleOpenBlockPanel(todo.id);
+                            }}
+                          >
+                            막힘 해결
+                          </button>
+                        )}
                         {linkedTrack && !isEditingGoalLink && (
                           <span className="text-[11px] text-slate-400">
                             → {linkedTrack.title || "목표"}
@@ -4123,6 +4217,27 @@ export default function Home() {
                           onSave={(id) => handleUpdateTodoGoalTrackId(todo, id)}
                           onCancel={() => setEditingGoalLinkTodoId(null)}
                           onUnlink={() => handleUpdateTodoGoalTrackId(todo, null)}
+                        />
+                      )}
+                      {openBlockPanelTodoId === todo.id && linkedGoalTrackId && (
+                        <TodoBlockPanel
+                          suggestion={blockSuggestion[todo.id] ?? null}
+                          loading={blockSuggestionLoading[todo.id] ?? false}
+                          rhythm={(() => {
+                            const counts = calcLast7Days(
+                              goalTrackEvents,
+                              linkedGoalTrackId!
+                            );
+                            const keys = getLastNDateKeys(7);
+                            return calcRhythmImpact(counts, keys);
+                          })()}
+                          onFetch={(blockType, situation) =>
+                            handleFetchTodoBlockSuggestion(todo, blockType, situation)
+                          }
+                          onApply={(newText) =>
+                            handleApplyTodoBlockSuggestion(todo, newText)
+                          }
+                          onClose={() => setOpenBlockPanelTodoId(null)}
                         />
                       )}
                       {dueAtMillis !== null && (
