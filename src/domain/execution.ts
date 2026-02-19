@@ -60,6 +60,49 @@ export const getExecutedDayCount = (
   keys: string[]
 ): number => keys.filter((k) => (counts[k] ?? 0) > 0).length;
 
+/** 7일 리듬 점 강도 스타일 (실행 횟수 기반). 0회=회색, 1~4+회=진해짐 - 레거시 */
+export const getDotStyle = (count: number): { background: string } => {
+  if (count <= 0) return { background: "#DADADA" };
+  const alpha = count >= 4 ? 1 : [0.35, 0.55, 0.75][count - 1] ?? 1;
+  return { background: `rgba(17,17,17,${alpha})` };
+};
+
+/** 투두 완료 비율 기반 점 스타일. total=0 → #EFEFEF, ratio에 따라 진해짐 */
+export const getDotStyleFromRatio = (
+  done: number,
+  total: number
+): { background: string } => {
+  if (total === 0) return { background: "#EFEFEF" };
+  const ratio = done / total;
+  if (ratio === 0) return { background: "#DADADA" };
+  if (ratio <= 0.25) return { background: "rgba(17,17,17,0.25)" };
+  if (ratio <= 0.5) return { background: "rgba(17,17,17,0.45)" };
+  if (ratio <= 0.75) return { background: "rgba(17,17,17,0.7)" };
+  return { background: "rgba(17,17,17,1.0)" };
+};
+
+/** 날짜별 목표 연결 투두 완료 비율. { dateKey: { done, total } } */
+export type CompletionRatioEntry = { done: number; total: number };
+
+/** 최근 7일별 완료 비율 (목표 연결 투두 기준) */
+export const calcLast7DaysCompletionRatios = (
+  todosByDateKey: Record<string, { done: boolean; goalTrackId?: string | null }[]>,
+  goalTrackId: string,
+  dateKeys: string[]
+): Record<string, CompletionRatioEntry> => {
+  const result: Record<string, CompletionRatioEntry> = {};
+  for (const key of dateKeys) {
+    const dayTodos = todosByDateKey[key] ?? [];
+    const linked = dayTodos.filter(
+      (t) => t.goalTrackId === goalTrackId
+    );
+    const total = linked.length;
+    const done = linked.filter((t) => t.done).length;
+    result[key] = { done, total };
+  }
+  return result;
+};
+
 /** 최근 7일 총 행동 수 */
 export const getTotalActionCount = (
   counts: Record<string, number>,

@@ -86,3 +86,12 @@ export const isDateKeyBefore = (a: string, b: string): boolean => a < b;
 
 /** dateKey 문자열 비교 (a <= b) */
 export const isDateKeyBeforeOrEqual = (a: string, b: string): boolean => a <= b;
+
+/** dateKey → 요일 한글 (로컬 기준). "월"|"화"|"수"|"목"|"금"|"토"|"일" */
+export const getWeekdayKoFromDateKey = (dateKey: string): string => {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  const day = date.getDay();
+  const labels = ["일", "월", "화", "수", "목", "금", "토"];
+  return labels[day] ?? "?";
+};

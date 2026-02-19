@@ -5,22 +5,38 @@ import type { GoalTrack } from "@/types/goalTrack";
 import type { GoalTrackEvent } from "@/types/goalTrackEvent";
 import {
   calcLast7Days,
+  calcLast7DaysCompletionRatios,
   getExecutedDayCount,
   getTotalActionCount,
   getLastExecutedText,
   recentEvents,
 } from "@/domain/execution";
 import { getLastNDateKeys } from "@/domain/date";
+import { getLocalDateKey } from "@/lib/date";
+import { RhythmDots } from "@/components/design/RhythmDots";
+
+type TodoForRatio = { done: boolean; goalTrackId?: string | null };
 
 type Props = {
   track: GoalTrack;
   events: GoalTrackEvent[];
+  /** 날짜별 투두. 있으면 완료 비율 기반 점 사용 */
+  todosByDateKey?: Record<string, TodoForRatio[]>;
 };
 
-export function ExecutionEvidenceCard({ track, events }: Props) {
+export function ExecutionEvidenceCard({
+  track,
+  events,
+  todosByDateKey = {},
+}: Props) {
   const [expanded, setExpanded] = React.useState(false);
-  const last7 = calcLast7Days(events, track.id);
   const last7Keys = getLastNDateKeys(7);
+  const last7 = calcLast7Days(events, track.id);
+  const completionRatios = calcLast7DaysCompletionRatios(
+    todosByDateKey,
+    track.id,
+    last7Keys
+  );
   const executedDays = getExecutedDayCount(last7, last7Keys);
   const totalActions = getTotalActionCount(last7, last7Keys);
   const lastExecuted = getLastExecutedText(last7, last7Keys);
@@ -52,28 +68,13 @@ export function ExecutionEvidenceCard({ track, events }: Props) {
       </p>
       {expanded && (
         <>
-          <div
-            className="mt-2 flex items-center"
-            style={{ gap: 10 }}
-          >
-            {last7Keys.map((key) => {
-              const count = last7[key] ?? 0;
-              const filled = count > 0;
-              return (
-                <div
-                  key={key}
-                  className="flex-shrink-0 rounded-full"
-                  style={{
-                    width: 8,
-                    height: 8,
-                    background: filled ? "#111" : "#DADADA",
-                  }}
-                  title={`${key}: ${count}개`}
-                />
-              );
-            })}
+          <div className="mt-2 overflow-visible">
+            <RhythmDots
+              dateKeys={last7Keys}
+              completionRatios={completionRatios}
+              todayKey={getLocalDateKey()}
+            />
           </div>
-          <p className="mt-1 text-[10px] text-slate-400">최근 7일</p>
           {recent.length > 0 ? (
             <ul className="mt-1 space-y-0.5">
               {recent.map((e) => (

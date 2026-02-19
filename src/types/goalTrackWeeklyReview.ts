@@ -6,6 +6,12 @@ export type WeeklyReviewRhythm = "steady" | "sporadic" | "stopped";
 /** 이번 주 상태 (3택1) */
 export type WeeklyStatus = "STEADY" | "SPORADIC" | "STOPPED";
 
+/** 결과 스냅샷 모드 */
+export type OutcomeMode = "metric" | "sense" | "skip";
+
+/** 체감 기록 (가까워짐/제자리/멀어짐) */
+export type OutcomeSense = "closer" | "same" | "farther";
+
 export type GoalTrackWeeklyReview = {
   id: string;
   goalTrackId: string;
@@ -30,6 +36,18 @@ export type GoalTrackWeeklyReview = {
   plannedWeekdays?: number[];
   /** 선택한 전략 태그 (복수) */
   selectedStrategies?: StrategyType[];
+  /** 결과 스냅샷 모드 (metric | sense | skip) */
+  outcomeMode?: OutcomeMode;
+  /** metric일 때: 라벨 (선택) */
+  metricLabel?: string;
+  /** metric일 때: 값 (필수) */
+  metricValue?: number | null;
+  /** metric일 때: 단위 (선택) */
+  metricUnit?: string;
+  /** sense일 때: 체감 (필수) */
+  sense?: OutcomeSense | null;
+  /** 한 줄 이유 (선택) */
+  outcomeNote?: string;
   /** AI 정리 결과 */
   aiRefinedRuleText?: string;
   aiRefineRationale?: string;

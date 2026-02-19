@@ -59,6 +59,7 @@ import type { GoalTrackWeeklyReview } from "@/types/goalTrackWeeklyReview";
 import {
   buildEventId,
   calcLast7Days,
+  calcLast7DaysCompletionRatios,
   getExecutedDayCount,
   recentEvents,
 } from "@/domain/execution";
@@ -76,7 +77,6 @@ import {
   deleteGoalTrackEventsByGoalTrackId,
   deleteGoalTrackEventsByTodoId,
 } from "@/lib/goalTrackEvents";
-import { ExecutionEvidenceCard } from "@/components/design/ExecutionEvidenceCard";
 import { WeeklyReviewCard } from "@/components/design/WeeklyReviewCard";
 import { InlineGoalLinkEditor } from "@/components/todo/InlineGoalLinkEditor";
 import { TodoBlockPanel } from "@/components/todo/TodoBlockPanel";
@@ -691,6 +691,9 @@ export default function Home() {
   const [goalTrackTodoText, setGoalTrackTodoText] = useState("");
   const [goalTrackTodoDueAt, setGoalTrackTodoDueAt] = useState("");
   const [goalTrackEvents, setGoalTrackEvents] = useState<GoalTrackEvent[]>([]);
+  const [todosByDateKey, setTodosByDateKey] = useState<
+    Record<string, TodoItem[]>
+  >({});
   const [goalTrackWeeklyReviews, setGoalTrackWeeklyReviews] = useState<
     GoalTrackWeeklyReview[]
   >([]);
@@ -1264,6 +1267,21 @@ export default function Home() {
                 STRATEGY_OPTIONS.includes(s as StrategyType)
               )
             : undefined,
+          outcomeMode:
+            data.outcomeMode === "metric" ||
+            data.outcomeMode === "sense" ||
+            data.outcomeMode === "skip"
+              ? data.outcomeMode
+              : undefined,
+          metricLabel: typeof data.metricLabel === "string" ? data.metricLabel : undefined,
+          metricValue:
+            typeof data.metricValue === "number" ? data.metricValue : undefined,
+          metricUnit: typeof data.metricUnit === "string" ? data.metricUnit : undefined,
+          sense:
+            data.sense === "closer" || data.sense === "same" || data.sense === "farther"
+              ? data.sense
+              : undefined,
+          outcomeNote: typeof data.outcomeNote === "string" ? data.outcomeNote : undefined,
           aiRefinedRuleText:
             typeof data.aiRefinedRuleText === "string" ? data.aiRefinedRuleText : undefined,
           aiRefineRationale:
@@ -1326,6 +1344,43 @@ export default function Home() {
       unsubscribeRecords();
     };
   }, [user, todayKey, yesterdayKey]);
+
+  useEffect(() => {
+    if (!user || !db) return;
+    const firestore = db;
+    const keys = getLastNDateKeys(7);
+    const unsubs = keys.map((dateKey) => {
+      const todosRef = collection(
+        firestore,
+        "users",
+        user.uid,
+        "days",
+        dateKey,
+        "todos"
+      );
+      const q = query(todosRef, orderBy("createdAt", "asc"));
+      return onSnapshot(q, (snapshot) => {
+        const nextTodos: TodoItem[] = snapshot.docs.map((item) => {
+          const data = item.data() as Omit<TodoItem, "id">;
+          return {
+            id: item.id,
+            text: data.text ?? "",
+            done: Boolean(data.done),
+            effects: Array.isArray(data.effects) ? data.effects : [],
+            createdAt: data.createdAt,
+            completedAt: data.completedAt,
+            dueAt: data.dueAt,
+            missedReasonType: normalizeMissedReasonType(data.missedReasonType),
+            goalId: typeof data.goalId === "string" ? data.goalId : null,
+            goalTrackId:
+              typeof data.goalTrackId === "string" ? data.goalTrackId : null,
+          };
+        });
+        setTodosByDateKey((prev) => ({ ...prev, [dateKey]: nextTodos }));
+      });
+    });
+    return () => unsubs.forEach((u) => u());
+  }, [user, db, todayKey]);
 
   useEffect(() => {
     if (!user || !db || goalTrackEventsBackfillRunRef.current) return;
@@ -1856,8 +1911,17 @@ export default function Home() {
     reviewWeekday: number
   ) => {
     if (!user || !db) return;
-    const trackRef = doc(db, "users", user.uid, "goalTracks", goalTrackId);
-    await updateDoc(trackRef, { reviewWeekday });
+    const track = goalTracks.find((t) => t.id === goalTrackId);
+    const designPlanId = track?.designPlanId;
+    const tracksToUpdate = designPlanId
+      ? goalTracks.filter((t) => t.designPlanId === designPlanId)
+      : [{ id: goalTrackId }];
+    const batch = writeBatch(db);
+    for (const t of tracksToUpdate) {
+      const ref = doc(db, "users", user.uid, "goalTracks", t.id);
+      batch.update(ref, { reviewWeekday });
+    }
+    await batch.commit();
     setEditingReviewDayGoalTrackId(null);
   };
 
@@ -2103,6 +2167,12 @@ export default function Home() {
     nextWeekRuleText: string;
     plannedWeekdays?: number[];
     selectedStrategies?: StrategyType[];
+    outcomeMode?: "metric" | "sense" | "skip";
+    metricLabel?: string;
+    metricValue?: number | null;
+    metricUnit?: string;
+    sense?: "closer" | "same" | "farther" | null;
+    outcomeNote?: string;
     aiRefinedRuleText?: string;
     aiRefineRationale?: string;
   }) => {
@@ -2143,6 +2213,12 @@ export default function Home() {
           nextWeekOneChange: data.nextWeekRuleText,
           plannedWeekdays: data.plannedWeekdays ?? null,
           selectedStrategies: data.selectedStrategies ?? null,
+          outcomeMode: data.outcomeMode ?? null,
+          metricLabel: data.metricLabel ?? null,
+          metricValue: data.metricValue ?? null,
+          metricUnit: data.metricUnit ?? null,
+          sense: data.sense ?? null,
+          outcomeNote: data.outcomeNote ?? null,
           aiRefinedRuleText: data.aiRefinedRuleText ?? null,
           aiRefineRationale: data.aiRefineRationale ?? null,
           coachFact: coach.fact,
@@ -3931,7 +4007,6 @@ export default function Home() {
                                     + 투두 추가
                                   </button>
                                 )}
-                                <ExecutionEvidenceCard track={track} events={goalTrackEvents} />
                                 <WeeklyReviewCard
                                   track={track}
                                   review={
@@ -3942,7 +4017,17 @@ export default function Home() {
                                     ) ?? null
                                   }
                                   weekStartKey={getWeekStartKeyKST()}
+                                  planReviewWeekday={
+                                    goalTracks.filter(
+                                      (t) => t.designPlanId === plan.id
+                                    )[0]?.reviewWeekday ?? 6
+                                  }
                                   last7DaysCounts={calcLast7Days(goalTrackEvents, track.id)}
+                                  last7DaysCompletionRatios={calcLast7DaysCompletionRatios(
+                                    todosByDateKey,
+                                    track.id,
+                                    getLastNDateKeys(7)
+                                  )}
                                   recentExecution={(() => {
                                     const counts = calcLast7Days(
                                       goalTrackEvents,
