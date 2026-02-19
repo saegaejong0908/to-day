@@ -14,6 +14,7 @@ import {
   collection,
   deleteDoc,
   doc,
+  getDoc,
   getDocs,
   limit,
   onSnapshot,
@@ -50,7 +51,6 @@ import {
   initialEffectState,
 } from "@/store/effectReducer";
 import { MissedReasonType } from "@/types/missed-reason";
-import { STRATEGY_OPTIONS, type StrategyType } from "@/types/strategyType";
 import type { RecordItem } from "@/types/record";
 import type { DesignPlan } from "@/types/designPlan";
 import type { GoalTrack } from "@/types/goalTrack";
@@ -680,6 +680,8 @@ export default function Home() {
   const [selectedDesignPlanId, setSelectedDesignPlanId] = useState<string | null>(null);
   const [newDesignPlanTitle, setNewDesignPlanTitle] = useState("");
   const [newGoalTrackTitle, setNewGoalTrackTitle] = useState("");
+  const [weeklyReviewContentExpanded, setWeeklyReviewContentExpanded] =
+    useState(false);
   const [editingReviewDayGoalTrackId, setEditingReviewDayGoalTrackId] = useState<
     string | null
   >(null);
@@ -1242,6 +1244,27 @@ export default function Home() {
               (n) => typeof n === "number" && n >= 0 && n <= 6
             )
           : undefined;
+        const nextWeekRules = Array.isArray(data.nextWeekRules)
+          ? (
+              data.nextWeekRules as Array<{
+                text?: string;
+                weekday?: number;
+                weekdays?: number[];
+              }>
+            )
+              .filter((r) => r && typeof r.text === "string" && r.text.trim())
+              .map((r) => {
+                const weekdays = Array.isArray(r.weekdays)
+                  ? r.weekdays.filter((d) => d >= 0 && d <= 6)
+                  : typeof r.weekday === "number" && r.weekday >= 0 && r.weekday <= 6
+                    ? [r.weekday]
+                    : undefined;
+                return {
+                  text: (r.text ?? "").trim(),
+                  weekdays: weekdays && weekdays.length > 0 ? weekdays : undefined,
+                };
+              })
+          : undefined;
         const blockReason =
           typeof data.blockReason === "string" &&
           Object.values(MissedReasonType).includes(data.blockReason as MissedReasonType)
@@ -1262,11 +1285,7 @@ export default function Home() {
           nextWeekKeepOne:
             typeof data.nextWeekKeepOne === "string" ? data.nextWeekKeepOne : undefined,
           plannedWeekdays,
-          selectedStrategies: Array.isArray(data.selectedStrategies)
-            ? (data.selectedStrategies as string[]).filter((s): s is StrategyType =>
-                STRATEGY_OPTIONS.includes(s as StrategyType)
-              )
-            : undefined,
+          nextWeekRules,
           outcomeMode:
             data.outcomeMode === "metric" ||
             data.outcomeMode === "sense" ||
@@ -2132,7 +2151,9 @@ export default function Home() {
   ) => {
     if (!user || !db || !actionText.trim()) return;
     const normalizedText = actionText.trim();
-    const targetDateKey = getNextWeekDateKeyByWeekdayKST(weekday);
+    // weekday: 0=일, 1=월, ... 6=토 (Date.getDay()) → 0=월...6=일 (ISO) 변환
+    const isoWeekday = (weekday + 6) % 7;
+    const targetDateKey = getNextWeekDateKeyByWeekdayKST(isoWeekday);
     const todosRef = collection(db, "users", user.uid, "days", targetDateKey, "todos");
     const duplicateSnapshot = await getDocs(
       query(todosRef, where("goalTrackId", "==", goalTrackId), limit(50))
@@ -2158,23 +2179,54 @@ export default function Home() {
     window.setTimeout(() => setExecutionToast(null), 2000);
   };
 
-  const handleSaveWeeklyReview = async (data: {
+  const handleSaveSnapshotOnly = async (data: {
     goalTrackId: string;
     weekStartKey: string;
-    status: "STEADY" | "SPORADIC" | "STOPPED";
-    blockReason?: MissedReasonType | null;
-    blockNote?: string;
-    nextWeekRuleText: string;
-    plannedWeekdays?: number[];
-    selectedStrategies?: StrategyType[];
     outcomeMode?: "metric" | "sense" | "skip";
     metricLabel?: string;
     metricValue?: number | null;
     metricUnit?: string;
     sense?: "closer" | "same" | "farther" | null;
     outcomeNote?: string;
-    aiRefinedRuleText?: string;
-    aiRefineRationale?: string;
+  }) => {
+    if (!user || !db) return;
+    setWeeklyReviewSaving(true);
+    try {
+      const reviewId = buildReviewId(data.goalTrackId, data.weekStartKey);
+      const reviewRef = doc(
+        db,
+        "users",
+        user.uid,
+        "goalTrackWeeklyReviews",
+        reviewId
+      );
+      await updateDoc(reviewRef, {
+        outcomeMode: data.outcomeMode ?? null,
+        metricLabel: data.metricLabel ?? null,
+        metricValue: data.metricValue ?? null,
+        metricUnit: data.metricUnit ?? null,
+        sense: data.sense ?? null,
+        outcomeNote: data.outcomeNote ?? null,
+        updatedAt: serverTimestamp(),
+      });
+    } finally {
+      setWeeklyReviewSaving(false);
+    }
+  };
+
+  const handleSaveWeeklyReview = async (data: {
+    goalTrackId: string;
+    weekStartKey: string;
+    status: "STEADY" | "SPORADIC" | "STOPPED";
+    blockReason?: MissedReasonType | null;
+    blockNote?: string;
+    nextWeekRules: Array<{ text: string; weekdays?: number[] }>;
+    outcomeMode?: "metric" | "sense" | "skip";
+    metricLabel?: string;
+    metricValue?: number | null;
+    metricUnit?: string;
+    sense?: "closer" | "same" | "farther" | null;
+    outcomeNote?: string;
   }) => {
     if (!user || !db) return;
     setWeeklyReviewSaving(true);
@@ -2186,10 +2238,11 @@ export default function Home() {
           : data.status === "SPORADIC"
             ? "sporadic"
             : "stopped";
+      const firstRuleText = data.nextWeekRules[0]?.text ?? "";
       const coach = buildWeeklyCoach(counts, {
         rhythm,
         wobbleMoment: "",
-        nextWeekRuleText: data.nextWeekRuleText,
+        nextWeekRuleText: firstRuleText,
       });
       const reviewId = buildReviewId(data.goalTrackId, data.weekStartKey);
       const reviewRef = doc(
@@ -2199,7 +2252,18 @@ export default function Home() {
         "goalTrackWeeklyReviews",
         reviewId
       );
-      const existing = goalTrackWeeklyReviews.some((r) => r.id === reviewId);
+      const existingSnap = await getDoc(reviewRef);
+      const existingData = existingSnap.exists() ? existingSnap.data() : {};
+      const existing = !!existingSnap.exists();
+      const mergedNextWeekRules =
+        data.nextWeekRules?.length > 0
+          ? data.nextWeekRules
+          : (existingData.nextWeekRules ?? data.nextWeekRules ?? []);
+      const mergedPlannedWeekdays =
+        mergedNextWeekRules[0]?.weekdays?.[0] != null
+          ? [mergedNextWeekRules[0].weekdays![0]]
+          : (existingData.plannedWeekdays ?? null);
+      const mergedFirstRuleText = mergedNextWeekRules[0]?.text ?? firstRuleText;
       await setDoc(
         reviewRef,
         {
@@ -2209,18 +2273,16 @@ export default function Home() {
           status: data.status,
           blockReason: data.blockReason ?? null,
           blockNote: data.blockNote ?? null,
-          nextWeekRuleText: data.nextWeekRuleText,
-          nextWeekOneChange: data.nextWeekRuleText,
-          plannedWeekdays: data.plannedWeekdays ?? null,
-          selectedStrategies: data.selectedStrategies ?? null,
-          outcomeMode: data.outcomeMode ?? null,
-          metricLabel: data.metricLabel ?? null,
-          metricValue: data.metricValue ?? null,
-          metricUnit: data.metricUnit ?? null,
-          sense: data.sense ?? null,
-          outcomeNote: data.outcomeNote ?? null,
-          aiRefinedRuleText: data.aiRefinedRuleText ?? null,
-          aiRefineRationale: data.aiRefineRationale ?? null,
+          nextWeekRuleText: mergedFirstRuleText,
+          nextWeekOneChange: mergedFirstRuleText,
+          nextWeekRules: mergedNextWeekRules,
+          plannedWeekdays: mergedPlannedWeekdays,
+          outcomeMode: data.outcomeMode ?? existingData.outcomeMode ?? null,
+          metricLabel: data.metricLabel ?? existingData.metricLabel ?? null,
+          metricValue: data.metricValue ?? existingData.metricValue ?? null,
+          metricUnit: data.metricUnit ?? existingData.metricUnit ?? null,
+          sense: data.sense ?? existingData.sense ?? null,
+          outcomeNote: data.outcomeNote ?? existingData.outcomeNote ?? null,
           coachFact: coach.fact,
           coachPattern: coach.pattern,
           coachAction: coach.action,
@@ -4060,6 +4122,11 @@ export default function Home() {
                                   }
                                   onApplyAction={handleApplyWeeklyCoachAction}
                                   onSave={handleSaveWeeklyReview}
+                                  onSaveSnapshotOnly={handleSaveSnapshotOnly}
+                                  reviewContentExpanded={weeklyReviewContentExpanded}
+                                  onReviewContentExpandedChange={
+                                    setWeeklyReviewContentExpanded
+                                  }
                                   saving={weeklyReviewSaving}
                                 />
                               </div>

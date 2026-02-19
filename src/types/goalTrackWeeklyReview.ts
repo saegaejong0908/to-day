@@ -1,5 +1,4 @@
 import type { MissedReasonType } from "@/types/missed-reason";
-import type { StrategyType } from "@/types/strategyType";
 
 export type WeeklyReviewRhythm = "steady" | "sporadic" | "stopped";
 
@@ -28,14 +27,14 @@ export type GoalTrackWeeklyReview = {
   blockNote?: string;
   /** @deprecated nextWeekRuleText 사용 */
   nextWeekOneChange?: string;
-  /** 다음 주 실행 규칙 1개 (필수) */
+  /** 다음 주 실행 규칙 1개 (필수) - 하위호환 */
   nextWeekRuleText?: string;
   /** @deprecated */
   nextWeekKeepOne?: string;
-  /** 언제 할지 (0=일...6=토, 복수) */
+  /** 언제 할지 (0=일...6=토, 복수) - 하위호환 */
   plannedWeekdays?: number[];
-  /** 선택한 전략 태그 (복수) */
-  selectedStrategies?: StrategyType[];
+  /** 다음 주 실행 (복수, 각각 요일 복수 선택 가능) */
+  nextWeekRules?: Array<{ text: string; weekdays?: number[] }>;
   /** 결과 스냅샷 모드 (metric | sense | skip) */
   outcomeMode?: OutcomeMode;
   /** metric일 때: 라벨 (선택) */
